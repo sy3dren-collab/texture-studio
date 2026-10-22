@@ -41,7 +41,7 @@ def main(argv=None):
             outputs = {"base_color": tile}
         else:
             outputs = {f"variant_{i:02d}": image for i, image in enumerate(generate_variants(tile, args.count, args.seed))}
-        metadata.update(lighting_strength=.7, lighting_radius=.15, preserve_contrast=.4, seam_strength=1)
+        metadata.update(lighting_strength=.85, lighting_radius=.1, preserve_contrast=.7, seam_strength=1)
     if args.maps:
         for name, image in list(outputs.items()):
             if name == "base_color" or name.startswith("variant_"):

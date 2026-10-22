@@ -36,19 +36,87 @@ def validate(image):
         raise ValueError("圖片包含無效數值")
 
 
-def correct_lighting(image, strength=0.7, radius=0.15, preserve_contrast=0.4, color=False):
-    """Multiscale log illumination estimate; cannot distinguish albedo from lighting."""
+def crop_image(image, region=None):
+    """Non-destructive source selection in normalized (left, top, right, bottom)."""
+    validate(image)
+    if region is None:
+        return image
+    values = np.asarray(region, dtype=float)
+    if values.shape != (4,) or not np.isfinite(values).all():
+        raise ValueError("製圖範圍格式無效")
+    left, top, right, bottom = values
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise ValueError("製圖範圍超出圖片")
+    h, w = image.shape[:2]
+    x0, y0 = int(np.floor(left*w+1e-7)), int(np.floor(top*h+1e-7))
+    x1, y1 = int(np.ceil(right*w-1e-7)), int(np.ceil(bottom*h-1e-7))
+    if min(x1-x0, y1-y0) < 4:
+        raise ValueError("製圖範圍至少需要 4×4 像素")
+    return image[y0:y1, x0:x1]
+
+
+def _illumination(log_image, radius, preserve_contrast):
+    """Robust broad shading fit followed by a texture-resistant residual filter."""
+    h, w = log_image.shape
+    # Fit on a fixed grid, keeping large inputs fast and the fit well-conditioned.
+    grid = cv2.resize(log_image, (32, 32), interpolation=cv2.INTER_AREA)
+    y, x = np.mgrid[-1:1:32j, -1:1:32j]
+    basis = np.stack((np.ones_like(x), x, y, x*x, x*y, y*y, x**4, y**4, x*x*y*y), axis=-1)
+    design = basis.reshape(-1, basis.shape[-1])
+    values = grid.ravel()
+    weights = np.ones_like(values)
+    for _ in range(5):
+        root = np.sqrt(weights)
+        coefficients = np.linalg.lstsq(design*root[:, None], values*root, rcond=None)[0]
+        residual = values-design@coefficients
+        scale = max(.025, 1.4826*np.median(np.abs(residual-np.median(residual))))
+        weights = 1/(1+(residual/(scale*2))**2)
+    y, x = np.mgrid[-1:1:complex(h), -1:1:complex(w)]
+    surface = sum(coefficient*term for coefficient, term in zip(coefficients,
+        (np.ones_like(x), x, y, x*x, x*y, y*y, x**4, y**4, x*x*y*y))).astype("float32")
+    residual = log_image-surface
+    scale = max(.025, 1.4826*np.median(np.abs(residual-np.median(residual))))
+    # Dark narrow veins get little influence on the illumination estimate.
+    # preserve_contrast protects texture outliers, rather than weakening all
+    # shadow removal as the old strength*(1-preserve_contrast) implementation did.
+    cutoff = scale*(3.5-2*preserve_contrast)
+    weights = (1/(1+(residual/cutoff)**2)).astype("float32")
+    sigma = max(1.2, min(h, w)*radius)
+    smooth = np.zeros_like(log_image)
+    for factor in (.6, 1.3):
+        numerator = cv2.GaussianBlur(residual*weights, (0, 0), sigma*factor, borderType=cv2.BORDER_REFLECT)
+        denominator = cv2.GaussianBlur(weights, (0, 0), sigma*factor, borderType=cv2.BORDER_REFLECT)
+        smooth += .5*numerator/np.maximum(denominator, 1e-6)
+    return surface+smooth
+
+
+def correct_lighting(image, strength=0.85, radius=0.1, preserve_contrast=0.7, color=False):
+    """Correct vignettes/gradients on a bounded working image; retain RGB detail.
+
+    A single RGB image cannot uniquely separate material color from lighting.
+    Strength zero is an exact bypass; gains are limited to avoid extreme noise.
+    """
     validate(image)
     if not 0 <= strength <= 1 or not 0.01 <= radius <= 0.5 or not 0 <= preserve_contrast <= 1:
         raise ValueError("光照參數超出範圍")
-    luminance = image if color else np.sum(image * [0.2126, 0.7152, 0.0722], axis=2, keepdims=True)
-    log = np.log(np.maximum(luminance, 1 / 1024)).astype(np.float32)
-    sigma = max(1, min(image.shape[:2]) * radius)
-    low = sum(cv2.GaussianBlur(log, (0, 0), s, borderType=cv2.BORDER_REFLECT) for s in (sigma, sigma * 2, sigma * 4)) / 3
-    if low.ndim == 2:
-        low = low[..., None]
-    gain = np.exp((low.mean(axis=(0, 1), keepdims=True) - low) * strength * (1 - preserve_contrast))
-    return np.clip(image * gain, 0, 1).astype(np.float32)
+    if strength == 0:
+        return image.copy()
+    h, w = image.shape[:2]
+    ratio = min(1, 384/max(h, w))
+    small = cv2.resize(image, (max(4, round(w*ratio)), max(4, round(h*ratio))), interpolation=cv2.INTER_AREA)
+    luminance = small if color else np.sum(small*np.array([.2126, .7152, .0722], "float32"), axis=2, keepdims=True)
+    log = np.log(np.maximum(luminance, 1/4096))
+    channels = []
+    for channel in range(log.shape[2]):
+        field = _illumination(log[..., channel], radius, preserve_contrast)
+        # Use the well-lit portion as reference, instead of retaining a darkened
+        # overall mean when most corners are underexposed.
+        gain_log = np.clip(strength*(np.percentile(field, 75)-field), -np.log(4), np.log(4))
+        channels.append(cv2.resize(gain_log, (w, h), interpolation=cv2.INTER_LINEAR))
+    gain = np.exp(np.stack(channels, axis=2))
+    if not color:
+        gain = np.minimum(gain, 1/np.maximum(image.max(axis=2, keepdims=True), 1e-6))
+    return np.clip(image*gain, 0, 1).astype(np.float32)
 
 
 def seamless(image, strength=1.0):

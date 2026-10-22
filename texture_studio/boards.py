@@ -24,6 +24,7 @@ class BoardSettings:
     brightness: float = .03
     mirror: bool = False
     weights: tuple = ()
+    lighting_strength: float = .85
 
     def metadata(self):
         return {**asdict(self), "uv_ratio": self.world_width_mm / self.world_height_mm,
@@ -47,6 +48,8 @@ def _check(config, images):
         raise ValueError("倒角或錯縫比例無效")
     if c.min_length_mm <= 0 or c.max_length_mm < c.min_length_mm:
         raise ValueError("最短／最長板長無效")
+    if not 0 <= c.lighting_strength <= 1:
+        raise ValueError("光照校正強度必須介於 0 與 1")
     if c.weights and (len(c.weights) != len(images) or min(c.weights) < 0 or sum(c.weights) <= 0):
         raise ValueError("素材權重必須與素材數量相同，且總和大於零")
     if c.pattern not in {"straight", "half", "third", "quarter", "random", "variable", "custom", "herringbone", "chevron", "basketweave"}:
@@ -84,7 +87,7 @@ def generate_boards(images, config=None, progress=lambda value: None):
     c = config or BoardSettings()
     _check(c, images)
     rng = np.random.default_rng(c.seed)
-    images = [correct_lighting(image, .35) for image in images]
+    images = [correct_lighting(image, c.lighting_strength) for image in images]
     base = np.zeros((c.height, c.width, 3), "float32")
     gap = np.zeros((c.height, c.width), "float32")
     height = np.zeros_like(gap)
