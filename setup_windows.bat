@@ -1,9 +1,68 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
-py -3.11 -m venv .venv
+title Texture Studio - Setup
+if not exist "requirements-dev.txt" goto incomplete
+if not exist "texture_studio\ui.py" goto incomplete
+if exist ".venv\Scripts\python.exe" goto validate
+
+echo Looking for 64-bit Python 3.11, 3.12 or 3.13...
+for %%V in (3.12 3.11 3.13) do (
+  py -%%V -c "import struct,sys; sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))" >nul 2>&1
+  if not errorlevel 1 (
+    py -%%V -m venv .venv
+    if errorlevel 1 goto failed
+    goto validate
+  )
+)
+python -c "import struct,sys; sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))" >nul 2>&1
+if errorlevel 1 goto missing_python
+python -m venv .venv
+if errorlevel 1 goto failed
+
+:validate
+".venv\Scripts\python.exe" -c "import struct,sys; print(sys.version); sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))"
+if errorlevel 1 goto incompatible
+if not exist logs mkdir logs
+echo Installing dependencies and running tests. This may take several minutes.
+echo Detailed progress is saved to logs\setup.log
+call :install_steps > "logs\setup.log" 2>&1
+set "TS_EXIT=%errorlevel%"
+type "logs\setup.log"
+if not "%TS_EXIT%"=="0" goto failed
+echo.
+echo Setup completed. Run start_windows.bat to open the app.
+pause
+exit /b 0
+
+:install_steps
+".venv\Scripts\python.exe" -m pip --disable-pip-version-check install -r requirements-dev.txt
 if errorlevel 1 exit /b 1
-.venv\Scripts\python -m pip install -r requirements-dev.txt
-if errorlevel 1 exit /b 1
-.venv\Scripts\python -m pytest -q
+set "QT_QPA_PLATFORM=offscreen"
+".venv\Scripts\python.exe" -m pytest -q
 exit /b %errorlevel%
+
+:missing_python
+echo Install 64-bit Python 3.12 from https://www.python.org/downloads/windows/
+echo Include the Python Launcher and Add Python to PATH, then run setup again.
+echo These pinned dependencies support Python 3.11 through 3.13, not 3.14.
+pause
+exit /b 1
+
+:incompatible
+echo The existing .venv uses an unsupported Python or a 32-bit interpreter.
+echo Rename .venv to .venv-backup, install 64-bit Python 3.12, and run setup again.
+pause
+exit /b 1
+
+:incomplete
+echo Extract ALL files from the ZIP before running setup.
+echo Do not run this script inside the ZIP viewer.
+pause
+exit /b 1
+
+:failed
+echo.
+echo Setup failed. Send the error above or logs\setup.log for diagnosis.
+pause
+exit /b 1

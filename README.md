@@ -6,7 +6,7 @@
 
 ## Windows 10／11
 
-安裝 64-bit Python 3.11（包含 Python Launcher），執行：
+先將 ZIP **完整解壓縮**到一般資料夾，不可在壓縮檔檢視器內直接執行。安裝 64-bit Python 3.12（3.11–3.13 也支援，包含 Python Launcher），執行：
 
 ```bat
 setup_windows.bat
@@ -16,7 +16,7 @@ build_windows.bat
 
 打包結果為 `dist\TextureStudio\TextureStudio.exe`，需分發**整個 TextureStudio 資料夾**。目標電腦不需 Python。打包必須在 Windows 執行；Linux 無法藉此產生 Windows EXE。本次沒有產生或驗證 Windows EXE。
 
-Python 3.12 或更新版本可手動建立環境：
+本版固定依賴支援 Python 3.11–3.13；Python 3.14 目前不支援。也可手動建立環境：
 
 ```sh
 python -m venv .venv
@@ -28,6 +28,12 @@ python -m texture_studio
 ```
 
 Linux 伺服器測試設定 `QT_QPA_PLATFORM=offscreen`。離屏模式不提供可互動桌面，實際操作需有圖形顯示環境。
+
+### 啟動失敗或視窗閃退
+
+先執行 `setup_windows.bat`，確認出現 `Setup completed`；再執行 `start_windows.bat`。修正版啟動腳本會在錯誤時保留視窗，安裝及啟動紀錄分別位於 `logs/setup.log`、`logs/startup-console.log`，Python 啟動例外另存 `logs/texture-studio.log`。請提供錯誤文字以診斷，不需重裝所有套件猜測原因。
+
+若舊的 `.venv` 使用不支援的 Python，先將它改名為 `.venv-backup`，安裝 64-bit Python 3.12，再重跑安裝腳本。腳本不會自動刪除既有環境。Windows 批次腳本仍須在 Windows 實機驗證；Linux 測試不能證明 Windows 安裝成功。
 
 ## 使用方式
 
