@@ -18,14 +18,14 @@ def load_image(path):
         return np.asarray(image.convert("RGB"), dtype=np.float32) / 255
 
 
-def save_image(image, path):
+def save_image(image, path, color_space="sRGB"):
     from PIL import ImageCms
     path = Path(path)
     if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
         raise ValueError("輸出格式必須是 PNG、JPG 或 TIFF")
     path.parent.mkdir(parents=True, exist_ok=True)
     pixels = np.round(np.clip(image, 0, 1) * 255).astype(np.uint8)
-    options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()} if pixels.ndim == 3 else {}
+    options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()} if pixels.ndim == 3 and color_space == "sRGB" else {}
     Image.fromarray(pixels).save(path, **options)
 
 
