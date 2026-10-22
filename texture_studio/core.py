@@ -26,6 +26,8 @@ def save_image(image, path, color_space="sRGB"):
     path.parent.mkdir(parents=True, exist_ok=True)
     pixels = np.round(np.clip(image, 0, 1) * 255).astype(np.uint8)
     options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()} if pixels.ndim == 3 and color_space == "sRGB" else {}
+    if path.suffix.lower() in {".jpg", ".jpeg"}:
+        options.update(quality=95, subsampling=0)
     Image.fromarray(pixels).save(path, **options)
 
 

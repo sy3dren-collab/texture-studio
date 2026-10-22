@@ -7,7 +7,7 @@ from texture_studio.ui import Window
 from texture_studio.core import save_image
 
 
-def test_phase1_real_worker_and_project_roundtrip(tmp_path):
+def test_phase1_real_worker_and_jpeg_export(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = Window()
     errors = []
@@ -29,12 +29,12 @@ def test_phase1_real_worker_and_project_roundtrip(tmp_path):
     wait()
     assert len(window.outputs) == 1
     assert window.result.shape == image.shape
-    project = tmp_path / "專案.json"
-    window.write_project(project)
-    import json
-    assert json.loads(project.read_text())["settings"]["seed"] == 42
-    output = tmp_path / "輸出.png"
+    assert window.processed_settings["settings"]["seed"] == 42
+    output = tmp_path / "輸出.jpg"
     window.export_to(output, window.result)
     assert output.is_file()
+    from PIL import Image
+    with Image.open(output) as exported:
+        assert exported.format == "JPEG"
     assert source.read_bytes() == original_bytes
     window.close()

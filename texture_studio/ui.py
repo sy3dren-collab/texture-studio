@@ -1,13 +1,15 @@
 """Traditional Chinese desktop interface; computation runs outside the UI thread."""
-import json
 from pathlib import Path
+import tempfile
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Signal, Qt, QRectF, QPointF
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QRectF, QPointF, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QIcon, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QLabel, QFileDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QComboBox, QCheckBox, QMessageBox, QProgressBar, QGraphicsView, QGraphicsScene, QScrollArea, QSlider)
+    QComboBox, QCheckBox, QMessageBox, QProgressBar, QGraphicsView, QGraphicsScene, QScrollArea, QSlider, QColorDialog)
 from .core import load_image, save_image, correct_lighting, seamless, repeat_preview, crop_image
+from .appearance import adjust_material
+from .capture import ScreenCapture
 from . import __version__
 
 
@@ -145,17 +147,21 @@ class Preview(QGraphicsView):
 
 
 class PercentControl(QWidget):
-    def __init__(self, value=85):
+    valueChanged = Signal(int)
+
+    def __init__(self, value=85, minimum=0, maximum=100, suffix="%"):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(0, 100)
+        self.slider.setRange(minimum, maximum)
         self.label = QLabel()
-        self.slider.valueChanged.connect(lambda current: self.label.setText(f"{current}%"))
+        self.slider.valueChanged.connect(lambda current: self.label.setText(f"{current}{suffix}"))
+        self.slider.valueChanged.connect(self.valueChanged)
         layout.addWidget(self.slider)
         layout.addWidget(self.label)
         self.slider.setValue(value)
+        self.label.setText(f"{self.slider.value()}{suffix}")
 
     def value(self):
         return self.slider.value()
@@ -174,6 +180,7 @@ class Worker(QObject):
         super().__init__()
         self.operation = operation
 
+    @Slot()
     def run(self):
         try:
             def checkpoint(value):
@@ -198,12 +205,26 @@ class Window(QMainWindow):
         self.paths, self.weights = [], []
         self.regions = {}
         self.previous_outputs = []
+        self._previous_snapshot = None
+        self._restoring = False
+        self._closing = False
         self.processed_settings = None
         self.original = self.result = None
         self.outputs = []
         self.thread = None
         self.dirty = False
         self.seed_value = 42
+        self.tint_color = None
+        self._source_cache = {}
+        self._pending_preview = False
+        self._pending_export = None
+        self._generation = 0
+        self._capture_session = None
+        self._capture_temp = None
+        self._capture_count = 0
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(lambda: self.process(preview=True))
         root = QWidget()
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
@@ -220,6 +241,9 @@ class Window(QMainWindow):
         self.assets = QListWidget()
         left.addWidget(QLabel("素材 · 可直接拖入圖片"))
         left.addWidget(self.assets)
+        self.capture_button = QPushButton("截圖匯入素材")
+        self.capture_button.clicked.connect(self.start_capture)
+        left.addWidget(self.capture_button)
         self.button(left, "匯入圖片", self.import_images)
         self.button(left, "移除素材", self.remove_asset)
         self.info = QLabel("先匯入圖片，再按一鍵製圖")
@@ -265,6 +289,28 @@ class Window(QMainWindow):
         right.addRow("製圖模式", self.mode)
         self.light = PercentControl(85)
         right.addRow("去暗角／陰影", self.light)
+        self.material_saturation = PercentControl(100, 0, 200)
+        self.material_saturation.setToolTip("100% 保留原飽和度，0% 轉為灰階")
+        right.addRow("飽和度", self.material_saturation)
+        self.material_brightness = PercentControl(0, -100, 100)
+        self.material_brightness.setToolTip("0% 保留原明暗；向右變亮，向左變暗")
+        right.addRow("明暗度", self.material_brightness)
+        color_tools = QWidget()
+        color_layout = QHBoxLayout(color_tools)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        self.color_button = QPushButton("上色…")
+        self.color_button.clicked.connect(self.choose_color)
+        self.clear_color_button = QPushButton("恢復原色")
+        self.clear_color_button.clicked.connect(self.clear_color)
+        color_layout.addWidget(self.color_button)
+        color_layout.addWidget(self.clear_color_button)
+        right.addRow("素材顏色", color_tools)
+        self.material_scale = PercentControl(100, 25, 400)
+        self.material_scale.setToolTip("100% 原始大小；200% 紋路放大兩倍，輸出圖片尺寸不變")
+        right.addRow("素材縮放", self.material_scale)
+        self.material_angle = PercentControl(0, -180, 180, "°")
+        self.material_angle.setToolTip("以單張素材中心旋轉紋路，不旋轉整面木地板排列")
+        right.addRow("旋轉角度", self.material_angle)
         self.variant_count = self.number(right, "生成張數", 4, 2, 50, True)
         self.variation = PercentControl(20)
         right.addRow("變化程度", self.variation)
@@ -294,8 +340,7 @@ class Window(QMainWindow):
         self.shuffle_button.clicked.connect(self.reshuffle)
         right.addRow(self.shuffle_button)
         for text, function in [("一鍵製圖", self.process), ("取消", self.cancel),
-                ("回到上次結果", self.undo), ("輸出圖片", self.export), ("輸出全部", self.export_all),
-                ("儲存專案", self.save_project), ("開啟專案", self.open_project)]:
+                ("回到上次結果", self.undo), ("輸出 JPEG 圖片", self.export)]:
             button = QPushButton(text)
             button.clicked.connect(function)
             right.addRow(button)
@@ -307,7 +352,86 @@ class Window(QMainWindow):
         self.mode.currentIndexChanged.connect(self.update_mode)
         self.board_width.valueChanged.connect(self.update_board_limits)
         self.board_length.valueChanged.connect(self.update_board_limits)
+        for control in (self.light, self.material_saturation, self.material_brightness,
+                        self.material_scale, self.material_angle, self.variation):
+            control.valueChanged.connect(self.request_preview)
+        for control in (self.board_width, self.board_length, self.gap, self.variant_count):
+            control.valueChanged.connect(self.request_preview)
+        for control in (self.mode, self.pattern, self.resolution):
+            control.currentIndexChanged.connect(self.request_preview)
+        self.direction.toggled.connect(self.request_preview)
         self.update_mode()
+
+    def choose_color(self):
+        color = QColorDialog.getColor(QColor.fromRgbF(*(self.tint_color or [.5, .5, .5])), self, "選擇素材顏色")
+        if color.isValid():
+            self.tint_color = list(color.getRgbF()[:3])
+            self.color_button.setText(color.name())
+            self.color_button.setStyleSheet(f"border: 2px solid {color.name()};")
+            self.request_preview()
+
+    def clear_color(self):
+        self.tint_color = None
+        self.color_button.setText("上色…")
+        self.color_button.setStyleSheet("")
+        self.request_preview()
+
+    def request_preview(self, *_):
+        if self._restoring or self._closing:
+            return
+        self._generation += 1
+        if self.paths:
+            self._pending_preview = True
+            self.preview_timer.start(180)
+
+    def start_capture(self):
+        if self.thread is not None or self._capture_session is not None:
+            return
+        self.preview_timer.stop()
+        self._pending_preview = False
+        self._capture_maximized = self.isMaximized()
+        self.hide()
+        # Let Windows repaint the desktop before grabbing it, so the app is
+        # absent from the screenshot and the overlay is never captured.
+        QTimer.singleShot(220, self.open_capture)
+
+    def open_capture(self):
+        if self._closing:
+            return
+        try:
+            self._capture_session = ScreenCapture(self)
+            self._capture_session.selected.connect(self.capture_ready)
+            self._capture_session.cancelled.connect(self.restore_after_capture)
+            self._capture_session.start()
+        except Exception as error:
+            self.restore_after_capture()
+            self.error(str(error))
+
+    def restore_after_capture(self):
+        if self._capture_session is not None:
+            self._capture_session.close_overlays()
+            self._capture_session.deleteLater()
+            self._capture_session = None
+        self.showMaximized() if getattr(self, "_capture_maximized", False) else self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def capture_ready(self, image):
+        self.restore_after_capture()
+        self.import_capture(image)
+
+    def import_capture(self, image):
+        if self._capture_temp is None:
+            self._capture_temp = tempfile.TemporaryDirectory(prefix="texture-studio-capture-", ignore_cleanup_errors=True)
+        self._capture_count += 1
+        path = Path(self._capture_temp.name)/f"螢幕截圖_{self._capture_count:03d}.png"
+        if image.isNull() or min(image.width(), image.height()) < 4 or not image.save(str(path), "PNG"):
+            self.error("截圖無效或無法儲存")
+            return
+        self.add_paths([str(path)])
+        index = self.paths.index(str(path))
+        if self.assets.currentRow() != index:
+            self.assets.setCurrentRow(index)
 
     def update_mode(self, *_):
         mode = self.mode.currentIndex()
@@ -333,6 +457,10 @@ class Window(QMainWindow):
         return self.paths[index] if 0 <= index < len(self.paths) else None
 
     def edit_crop(self, enabled):
+        if enabled:
+            self.preview_timer.stop()
+            self._pending_preview = False
+            self._generation += 1
         self.preview.set_crop_mode(enabled)
         self.crop_hint.setText("拖曳框選範圍；框內拖曳移動，四角調整大小；按一鍵製圖套用" if enabled else
                               "框選後，僅使用範圍內的素材製作貼圖；不修改原始檔")
@@ -342,6 +470,7 @@ class Window(QMainWindow):
         path = self.current_path()
         if path is not None:
             self.regions[path] = list(region)
+            self._generation += 1
             self.dirty = True
             self.update_source_info()
 
@@ -349,6 +478,9 @@ class Window(QMainWindow):
         path = self.current_path()
         if path is not None:
             self.regions.pop(path, None)
+            self._generation += 1
+            self.preview_timer.stop()
+            self._pending_preview = False
             self.dirty = True
             self.update_source_info()
             self.refresh()
@@ -417,6 +549,12 @@ class Window(QMainWindow):
             else:
                 self.original = self.result = None
                 self.outputs = []
+                self.previous_outputs = []
+                self._previous_snapshot = None
+                self.processed_settings = None
+                self.preview_timer.stop()
+                self._pending_preview = False
+                self._source_cache.clear()
                 self.selection.clear()
                 self.preview.scene().clear()
                 self.info.setText("先匯入圖片，再按一鍵製圖")
@@ -431,6 +569,9 @@ class Window(QMainWindow):
         self.original = image
         self.result = image
         self.outputs = []
+        self.previous_outputs = []
+        self._previous_snapshot = None
+        self.processed_settings = None
         self.selection.clear()
         self.update_source_info()
         pixels = (image[::max(1, image.shape[0]//96), ::max(1, image.shape[1]//96)]*255).astype("uint8").copy()
@@ -465,66 +606,120 @@ class Window(QMainWindow):
                 "mirror": False, "color": False, "periodic": True, "arbitrary": False,
                 "translate": True, "derived": False, "pattern": self.pattern.currentData(),
                 "width": output_w, "height": output_h, "resize_output": edge is not None,
-                "output_size": edge, "variation": self.variation.value(), "quick_ui": True}
+                "output_size": edge, "variation": self.variation.value(), "quick_ui": True,
+                "material_saturation": self.material_saturation.value()/100,
+                "material_brightness": self.material_brightness.value()/100,
+                "material_scale": self.material_scale.value()/100,
+                "material_angle": self.material_angle.value(),
+                "tint": self.tint_color.copy() if self.tint_color is not None else None}
         return data
 
-    def process(self):
+    def snapshot(self):
+        return {"settings": self.settings(), "inputs": self.paths.copy(), "weights": self.weights.copy(),
+                "regions": {path: region.copy() for path, region in self.regions.items()},
+                "index": max(0, self.assets.currentRow()), "generation": self._generation}
+
+    def prepared_source(self, path, region, strength):
+        stat = Path(path).stat()
+        key = (path, stat.st_mtime_ns, stat.st_size, tuple(region) if region else None, strength)
+        if key not in self._source_cache:
+            image = crop_image(load_image(path), region)
+            image = seamless(correct_lighting(image, strength))
+            while len(self._source_cache) >= 4:
+                self._source_cache.pop(next(iter(self._source_cache)))
+            self._source_cache[key] = image
+        return self._source_cache[key]
+
+    def process(self, preview=False, export_request=None):
+        if self._closing:
+            return
         if self.thread is not None:
+            if preview:
+                self._pending_preview = True
+            elif export_request:
+                self._pending_export = export_request
             return
-        if not self.paths:
-            self.error("請先匯入圖片")
+        if not self.paths and export_request is None:
+            if not preview:
+                self.error("請先匯入圖片")
             return
-        settings = self.settings()
-        paths = self.paths.copy()
-        weights = self.weights.copy()
-        regions = {path: region.copy() for path, region in self.regions.items()}
-        index = max(0, self.assets.currentRow())
+        self.preview_timer.stop()
+        self._pending_preview = False
+        snapshot = export_request["snapshot"] if export_request else self.snapshot()
+        settings = snapshot["settings"].copy()
+        paths, weights, regions = snapshot["inputs"], snapshot["weights"], snapshot["regions"]
+        index = snapshot["index"]
+        if preview:
+            ratio = min(1, 1024/max(settings["width"], settings["height"]))
+            settings["width"] = max(4, round(settings["width"]*ratio))
+            settings["height"] = max(4, round(settings["height"]*ratio))
         self.crop_button.setChecked(False)
         self.compare.setChecked(False)
+
+        def appearance(image):
+            return adjust_material(image, settings["material_saturation"], settings["material_brightness"],
+                                   settings["tint"], settings["material_scale"], settings["material_angle"])
+
         def operation(progress):
+            import cv2
             if settings["mode"] != 2:
-                image = crop_image(load_image(paths[index]), regions.get(paths[index]))
-                progress(10)
-                image = correct_lighting(image, settings["light"], settings["radius"], settings["contrast"], settings["color"])
-                progress(35)
-                if settings["resize_output"]:
-                    import cv2
-                    image = cv2.resize(image, (settings["width"], settings["height"]), interpolation=cv2.INTER_CUBIC)
-                image = seamless(image, settings["blend"])
+                image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"])
+                progress(25)
+                size = (settings["width"], settings["height"])
+                if (image.shape[1], image.shape[0]) != size:
+                    image = cv2.resize(image, size, interpolation=cv2.INTER_AREA if preview else cv2.INTER_CUBIC)
+                image = appearance(image)
                 progress(60)
-            if settings["mode"] == 0:
-                outputs = [("base_color", image)]
-                if settings["derived"]:
-                    from .maps import derive_maps
-                    outputs += list(derive_maps(image).items())
-                return outputs
-            if settings["mode"] == 1:
-                from .variants import generate_variants
-                return [(f"variant_{i:02d}", result) for i, result in enumerate(generate_variants(
-                    image, count=settings["variant_count"], seed=settings["seed"], direction=settings["direction"],
-                    mirror=settings["mirror"], progress=progress, brightness=settings["brightness"],
-                    hue=settings["hue"], saturation=settings["saturation"], contrast=settings["random_contrast"],
-                    translate=settings["translate"], arbitrary_angle=settings["arbitrary"]))]
-            from .boards import BoardSettings, generate_boards
-            images = []
-            for i, path in enumerate(paths):
-                images.append(crop_image(load_image(path), regions.get(path)))
-                progress(10+int(30*(i+1)/len(paths)))
-            config = BoardSettings(width=settings["width"], height=settings["height"], board_width_mm=settings["board_width"],
-                board_length_mm=settings["board_length"], gap_mm=settings["gap"], pattern=settings["pattern"],
-                offset=settings["offset"], seed=settings["seed"], periodic=settings["periodic"],
-                world_width_mm=settings["world_width"], world_height_mm=settings["world_height"],
-                min_length_mm=settings["min_length"], max_length_mm=settings["max_length"],
-                bevel_mm=settings["bevel"], brightness=settings["brightness"], mirror=settings["mirror"], weights=tuple(weights),
-                lighting_strength=settings["light"])
-            result = generate_boards(images, config, progress=progress)
-            if settings["derived"]:
-                from .maps import derive_maps
-                result.update(derive_maps(result["base_color"], result["height_reference"]))
-            return list(result.items())
+                if settings["mode"] == 0:
+                    outputs = [("base_color", image)]
+                else:
+                    from .variants import generate_variants
+                    outputs = [(f"variant_{i:02d}", result) for i, result in enumerate(generate_variants(
+                        image, count=settings["variant_count"], seed=settings["seed"], direction=settings["direction"],
+                        mirror=False, progress=progress, brightness=settings["brightness"], hue=settings["hue"],
+                        saturation=settings["saturation"], contrast=settings["random_contrast"], translate=True))]
+            else:
+                from .boards import BoardSettings, generate_boards
+                images = []
+                for i, path in enumerate(paths):
+                    image = self.prepared_source(path, regions.get(path), settings["light"])
+                    if preview and max(image.shape[:2]) > 1024:
+                        factor = 1024/max(image.shape[:2])
+                        image = cv2.resize(image, (max(4, round(image.shape[1]*factor)), max(4, round(image.shape[0]*factor))),
+                                           interpolation=cv2.INTER_AREA)
+                    images.append(appearance(image))
+                    progress(10+int(30*(i+1)/len(paths)))
+                config = BoardSettings(width=settings["width"], height=settings["height"],
+                    board_width_mm=settings["board_width"], board_length_mm=settings["board_length"],
+                    gap_mm=settings["gap"], pattern=settings["pattern"], offset=.5, seed=settings["seed"], periodic=True,
+                    world_width_mm=settings["world_width"], world_height_mm=settings["world_height"],
+                    min_length_mm=settings["min_length"], max_length_mm=settings["max_length"],
+                    bevel_mm=1, brightness=settings["brightness"], mirror=False, weights=tuple(weights), lighting_strength=0)
+                result = generate_boards(images, config, progress=progress)
+                outputs = [("base_color", result["base_color"])]
+            if export_request:
+                progress(97)
+                name = export_request["output_name"]
+                if name == "base_color" and settings["mode"] == 1:
+                    name = outputs[0][0]
+                selected = next((image for key, image in outputs if key == name), None)
+                if selected is None:
+                    raise ValueError("這個變體已不在目前結果中，請重新選擇後輸出")
+                self.export_to(export_request["path"], selected, name, paths)
+            return outputs
+
         def completed(outputs):
-            self.processed_settings = {"settings": settings, "inputs": paths, "weights": weights, "regions": regions}
-            self.processed(outputs)
+            if snapshot["generation"] == self._generation:
+                previous = self.processed_settings
+                self.processed(outputs)
+                self._previous_snapshot = previous
+                self.processed_settings = snapshot
+                if preview:
+                    self.metrics.setText("調整預覽 · JPEG 輸出會使用所選的完整解析度")
+            else:
+                self._pending_preview = True
+            if export_request:
+                self.metrics.setText(f"已輸出 JPEG：{Path(export_request['path']).name}")
         self.run_job(operation, completed)
 
     def run_job(self, operation, callback):
@@ -537,8 +732,9 @@ class Window(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.progress.setValue)
-        worker.finished.connect(callback)
-        worker.failed.connect(self.error)
+        self._job_callback = callback
+        worker.finished.connect(self.job_result, Qt.QueuedConnection)
+        worker.failed.connect(self.job_failed)
         worker.done.connect(thread.quit)
         worker.done.connect(worker.deleteLater)
         thread.finished.connect(self.job_done)
@@ -547,19 +743,47 @@ class Window(QMainWindow):
         self.assets.setEnabled(False)
         self.crop_button.setEnabled(False)
         self.full_image_button.setEnabled(False)
+        self.capture_button.setEnabled(False)
         thread.start()
 
+    @Slot(object)
+    def job_result(self, result):
+        # A plain Python closure connected directly to Worker.finished runs in
+        # the worker thread under PySide. Route all UI callbacks through this
+        # QObject slot so widget/timer updates always happen on the UI thread.
+        if not self._closing:
+            self._job_callback(result)
+
+    @Slot()
     def job_done(self):
         self.thread = self.worker = None
         self.assets.setEnabled(True)
         self.crop_button.setEnabled(True)
         self.full_image_button.setEnabled(True)
+        self.capture_button.setEnabled(True)
+        if self._pending_export is not None:
+            request, self._pending_export = self._pending_export, None
+            QTimer.singleShot(0, lambda: self.process(export_request=request))
+        elif self._pending_preview:
+            self.preview_timer.start(0)
+
+    @Slot(str)
+    def job_failed(self, message):
+        if message.startswith("已取消"):
+            self.metrics.setText(message)
+        else:
+            self._pending_preview = False
+            self.error(message)
 
     def cancel(self):
+        self.preview_timer.stop()
+        self._pending_preview = False
+        self._pending_export = None
         if self.thread:
             self.thread.requestInterruption()
 
     def processed(self, outputs):
+        selected_name = self.selection.currentData()
         self.previous_outputs = self.outputs
         self.outputs = outputs
         self.dirty = True
@@ -569,12 +793,43 @@ class Window(QMainWindow):
         for name, _ in outputs:
             label = f"變體 {int(name.split('_')[-1])+1}" if name.startswith("variant_") else labels.get(name, name)
             self.selection.addItem(label, name)
-        self.select_output(0)
+        selected_index = self.selection.findData(selected_name)
+        self.selection.setCurrentIndex(max(0, selected_index))
+        self.select_output(max(0, selected_index))
 
     def undo(self):
-        if self.previous_outputs and not self.thread:
-            previous = self.previous_outputs
-            self.processed(previous)
+        if not self.previous_outputs or self.thread or self._previous_snapshot is None:
+            return
+        self.preview_timer.stop()
+        self._pending_preview = False
+        previous = self._previous_snapshot
+        old_snapshot = self.processed_settings
+        settings = previous["settings"]
+        self._restoring = True
+        try:
+            self.mode.setCurrentIndex(settings["mode"])
+            self.light.setValue(settings["light"]*100)
+            for name in ("material_saturation", "material_brightness", "material_scale"):
+                getattr(self, name).setValue(settings[name]*100)
+            self.material_angle.setValue(settings["material_angle"])
+            self.tint_color = settings["tint"].copy() if settings["tint"] else None
+            color = QColor.fromRgbF(*self.tint_color) if self.tint_color else None
+            self.color_button.setText(color.name() if color else "上色…")
+            self.color_button.setStyleSheet(f"border: 2px solid {color.name()};" if color else "")
+            for name in ("board_width", "board_length", "gap", "variant_count", "variation"):
+                getattr(self, name).setValue(settings[name])
+            self.direction.setChecked(settings["direction"])
+            self.pattern.setCurrentIndex(self.pattern.findData(settings["pattern"]))
+            self.resolution.setCurrentIndex(self.resolution.findData(settings["output_size"]))
+            self.seed_value = settings["seed"]
+            self.regions = {path: region.copy() for path, region in previous["regions"].items()}
+        finally:
+            self._restoring = False
+        self._generation += 1
+        self.processed(self.previous_outputs)
+        self.processed_settings = {**previous, "generation": self._generation}
+        self._previous_snapshot = old_snapshot
+        self.update_source_info()
 
     def select_output(self, index):
         if 0 <= index < len(self.outputs):
@@ -596,108 +851,41 @@ class Window(QMainWindow):
     def export(self):
         if self.result is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "輸出貼圖", "texture.png", "PNG (*.png);;JPEG (*.jpg);;TIFF (*.tiff)")
+        path, _ = QFileDialog.getSaveFileName(self, "輸出 JPEG 圖片", "texture.jpg", "JPEG 圖片 (*.jpg *.jpeg)")
         if path:
-            image = self.result
-            name = self.selection.currentData()
-            self.run_job(lambda progress: self.export_to(path, image, name), lambda _: self.metrics.setText("貼圖已輸出"))
+            destination = Path(path)
+            if destination.suffix.lower() not in {".jpg", ".jpeg"}:
+                destination = destination.with_suffix(".jpg")
+                if destination.exists() and QMessageBox.question(self, "覆寫 JPEG", f"{destination.name} 已存在，是否覆寫？") != QMessageBox.Yes:
+                    return
+            request = {"path": str(destination), "output_name": self.selection.currentData() or "base_color", "snapshot": self.snapshot()}
+            self.preview_timer.stop()
+            self.process(export_request=request)
 
-    def export_to(self, path, image, output_name=None):
-        if Path(path).resolve() in {Path(source).resolve() for source in self.paths}:
+    def export_to(self, path, image, output_name=None, source_paths=None):
+        if Path(path).suffix.lower() not in {".jpg", ".jpeg"}:
+            raise ValueError("請使用 .jpg 或 .jpeg 輸出")
+        if Path(path).resolve() in {Path(source).resolve() for source in (source_paths if source_paths is not None else self.paths)}:
             raise ValueError("不可覆寫原始素材")
         selected = output_name or self.selection.currentData()
         is_data = selected in ("normal_reference", "roughness_reference", "height_reference", "gap_mask")
         save_image(image, path, color_space="linear" if is_data else "sRGB")
 
-    def export_all(self):
-        if not self.outputs:
-            return
-        directory = QFileDialog.getExistingDirectory(self, "批次輸出資料夾")
-        if directory:
-            outputs = self.outputs.copy()
-            seed = self.seed_value
-            project = Path(directory) / "texture_project.json"
-            targets = [Path(directory) / f"{name}_seed{seed}.png" for name, _ in outputs]
-            if any(path.exists() for path in targets+[project]):
-                self.error("輸出檔案已存在；請選擇新的資料夾")
-                return
-            self.write_project(project)
-            def operation(progress):
-                for index, ((name, image), path) in enumerate(zip(outputs, targets)):
-                    progress(int(index/len(outputs)*100))
-                    self.export_to(path, image, name)
-            self.run_job(operation, lambda _: self.metrics.setText("全部貼圖與專案資訊已輸出"))
-
-    def write_project(self, path):
-        settings = self.settings()
-        data = {"version": __version__, "inputs": self.paths, "weights": self.weights, "settings": self.settings(),
-                "regions": self.regions,
-                "last_render": self.processed_settings,
-                "physical_size_mm": [settings["world_width"], settings["world_height"]],
-                "uv_ratio": settings["world_width"]/settings["world_height"],
-                "color_space": "Base Color: sRGB; data maps: linear/non-color",
-                "limitations": "RGB 衍生的高度、粗糙度及法線僅為估算，需目視驗證無縫品質。"}
-        Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def save_project(self):
-        path, _ = QFileDialog.getSaveFileName(self, "儲存專案", "texture_project.json", "JSON (*.json)")
-        if path:
-            try:
-                self.write_project(path)
-                self.dirty = False
-            except Exception as error:
-                self.error(str(error))
-
-    def open_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "開啟專案", "", "JSON (*.json)")
-        if not path:
-            return
-        try:
-            self.load_project(path)
-        except Exception as error:
-            self.error(str(error))
-
-    def load_project(self, path):
-        if self.thread is not None:
-            raise ValueError("請等待目前運算結束再開啟專案")
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        settings = data["settings"]
-        regions = data.get("regions", {})
-        for region in regions.values():
-            if len(region) != 4 or not all(np.isfinite(region)) or not (0 <= region[0] < region[2] <= 1 and 0 <= region[1] < region[3] <= 1):
-                raise ValueError("專案中的製圖範圍無效")
-        self.mode.setCurrentIndex(settings.get("mode", 0))
-        self.light.setValue(settings.get("light", .85)*100)
-        self.variant_count.setValue(settings.get("variant_count", 4))
-        self.direction.setChecked(settings.get("direction", True))
-        self.variation.setValue(settings.get("variation", min(100, settings.get("brightness", .03)/.15*100)))
-        self.seed_value = settings.get("seed", 42)
-        for name in ("board_width", "board_length", "gap"):
-            if name in settings:
-                getattr(self, name).setValue(settings[name])
-        pattern = self.pattern.findData(settings.get("pattern", "half"))
-        self.pattern.setCurrentIndex(max(0, pattern))
-        edge = settings.get("output_size")
-        if "output_size" not in settings and settings.get("resize_output"):
-            edge = max(settings.get("width", 1024), settings.get("height", 1024))
-        resolution = self.resolution.findData(edge)
-        self.resolution.setCurrentIndex(max(0, resolution))
-        self.assets.clear()
-        self.paths.clear()
-        self.weights.clear()
-        self.regions = regions
-        self.add_paths(data["inputs"])
-        self.weights = data.get("weights", [1]*len(self.paths))
-
     def error(self, message):
         QMessageBox.warning(self, "Texture Studio", message)
 
     def closeEvent(self, event):
+        self.preview_timer.stop()
+        self._pending_preview = False
+        self._pending_export = None
         if self.thread:
             self.cancel()
             self.error("正在取消運算，完成後即可關閉")
             event.ignore()
         else:
+            self._closing = True
+            if self._capture_temp is not None:
+                self._capture_temp.cleanup()
             event.accept()
 
 
