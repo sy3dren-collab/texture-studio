@@ -3,14 +3,16 @@ setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 title Texture Studio
 if not exist "texture_studio\ui.py" goto incomplete
-if not exist ".venv\Scripts\python.exe" (
+if not exist "windows_env.bat" goto incomplete
+call "%~dp0windows_env.bat"
+if not exist "%TS_VENV%\Scripts\python.exe" (
   echo Please run setup_windows.bat first.
   pause
   exit /b 1
 )
 if not exist logs mkdir logs
 echo Starting Texture Studio. Keep this window open while the app runs.
-".venv\Scripts\python.exe" -X faulthandler -u launch.py > "logs\startup-console.log" 2>&1
+"%TS_VENV%\Scripts\python.exe" -X faulthandler -u launch.py > "logs\startup-console.log" 2>&1
 set "TS_EXIT=%errorlevel%"
 if "%TS_EXIT%"=="0" exit /b 0
 echo.

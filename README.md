@@ -14,7 +14,9 @@ start_windows.bat
 build_windows.bat
 ```
 
-打包結果為 `dist\TextureStudio\TextureStudio.exe`，需分發**整個 TextureStudio 資料夾**。目標電腦不需 Python。打包必須在 Windows 執行；Linux 無法藉此產生 Windows EXE。本次沒有產生或驗證 Windows EXE。
+Windows 腳本會將環境安裝至 `%USERPROFILE%\.texture-studio\venv`，避免 ZIP 解壓縮目錄過長，導致 PySide6 安裝失敗。不需系統管理員權限或修改 Windows 長路徑登錄設定。三支腳本共用 `windows_env.bat`；也可設定 `TEXTURE_STUDIO_VENV` 使用自訂短路徑。先前安裝失敗的專案內 `.venv` 不會被刪除或沿用。
+
+打包結果為 `%USERPROFILE%\.texture-studio\packaging\dist\TextureStudio\TextureStudio.exe`，需分發**整個 TextureStudio 資料夾**。目標電腦不需 Python。打包必須在 Windows 執行；Linux 無法藉此產生 Windows EXE。本次沒有產生或驗證 Windows EXE。
 
 本版固定依賴支援 Python 3.11–3.13；Python 3.14 目前不支援。也可手動建立環境：
 
@@ -33,7 +35,17 @@ Linux 伺服器測試設定 `QT_QPA_PLATFORM=offscreen`。離屏模式不提供�
 
 先執行 `setup_windows.bat`，確認出現 `Setup completed`；再執行 `start_windows.bat`。修正版啟動腳本會在錯誤時保留視窗，安裝及啟動紀錄分別位於 `logs/setup.log`、`logs/startup-console.log`，Python 啟動例外另存 `logs/texture-studio.log`。請提供錯誤文字以診斷，不需重裝所有套件猜測原因。
 
-若舊的 `.venv` 使用不支援的 Python，先將它改名為 `.venv-backup`，安裝 64-bit Python 3.12，再重跑安裝腳本。腳本不會自動刪除既有環境。Windows 批次腳本仍須在 Windows 實機驗證；Linux 測試不能證明 Windows 安裝成功。
+若短路徑環境使用不支援的 Python，先將 `%USERPROFILE%\.texture-studio\venv` 改名保留，安裝 64-bit Python 3.12，再重跑安裝腳本。腳本不會自動刪除既有環境。Windows 批次腳本仍須在 Windows 實機驗證；Linux 測試不能證明 Windows 安裝成功。
+
+若使用舊 ZIP 遇到 Long Path 安裝錯誤，可在包含 `requirements.txt` 與 `launch.py` 的資料夾依序執行，不需重新下載：
+
+```bat
+py -3.12 -m venv "%USERPROFILE%\.texture-studio\venv"
+"%USERPROFILE%\.texture-studio\venv\Scripts\python.exe" -m pip install -r requirements.txt
+"%USERPROFILE%\.texture-studio\venv\Scripts\python.exe" launch.py
+```
+
+每一步成功後才進行下一步。`No module named cv2` 可能是前面套件安裝中斷造成，請先解決安裝錯誤。以上手動流程與新版啟動腳本使用相同短路徑，舊版 `start_windows.bat` 仍指向專案內 `.venv`，請使用上面的啟動命令或更新腳本。
 
 ## 使用方式
 

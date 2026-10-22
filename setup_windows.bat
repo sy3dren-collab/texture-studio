@@ -2,26 +2,29 @@
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 title Texture Studio - Setup
+if not exist "windows_env.bat" goto incomplete
+call "%~dp0windows_env.bat"
 if not exist "requirements-dev.txt" goto incomplete
 if not exist "texture_studio\ui.py" goto incomplete
-if exist ".venv\Scripts\python.exe" goto validate
+echo Environment location: %TS_VENV%
+if exist "%TS_VENV%\Scripts\python.exe" goto validate
 
 echo Looking for 64-bit Python 3.11, 3.12 or 3.13...
 for %%V in (3.12 3.11 3.13) do (
   py -%%V -c "import struct,sys; sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))" >nul 2>&1
   if not errorlevel 1 (
-    py -%%V -m venv .venv
+    py -%%V -m venv "%TS_VENV%"
     if errorlevel 1 goto failed
     goto validate
   )
 )
 python -c "import struct,sys; sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))" >nul 2>&1
 if errorlevel 1 goto missing_python
-python -m venv .venv
+python -m venv "%TS_VENV%"
 if errorlevel 1 goto failed
 
 :validate
-".venv\Scripts\python.exe" -c "import struct,sys; print(sys.version); sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))"
+"%TS_VENV%\Scripts\python.exe" -c "import struct,sys; print(sys.version); sys.exit(not (struct.calcsize('P') == 8 and (3,11) <= sys.version_info[:2] < (3,14)))"
 if errorlevel 1 goto incompatible
 if not exist logs mkdir logs
 echo Installing dependencies and running tests. This may take several minutes.
@@ -36,10 +39,10 @@ pause
 exit /b 0
 
 :install_steps
-".venv\Scripts\python.exe" -m pip --disable-pip-version-check install -r requirements-dev.txt
+"%TS_VENV%\Scripts\python.exe" -m pip --disable-pip-version-check install -r requirements-dev.txt
 if errorlevel 1 exit /b 1
 set "QT_QPA_PLATFORM=offscreen"
-".venv\Scripts\python.exe" -m pytest -q
+"%TS_VENV%\Scripts\python.exe" -m pytest -q
 exit /b %errorlevel%
 
 :missing_python
@@ -50,8 +53,9 @@ pause
 exit /b 1
 
 :incompatible
-echo The existing .venv uses an unsupported Python or a 32-bit interpreter.
-echo Rename .venv to .venv-backup, install 64-bit Python 3.12, and run setup again.
+echo The existing environment uses an unsupported Python or a 32-bit interpreter.
+echo Rename this directory to preserve it: %TS_VENV%
+echo Then install 64-bit Python 3.12 and run setup again.
 pause
 exit /b 1
 
