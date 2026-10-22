@@ -21,8 +21,8 @@ def load_image(path):
 def save_image(image, path, color_space="sRGB"):
     from PIL import ImageCms
     path = Path(path)
-    if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
-        raise ValueError("輸出格式必須是 PNG、JPG 或 TIFF")
+    if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+        raise ValueError("圖片格式必須是 PNG、JPG、TIFF 或 BMP")
     path.parent.mkdir(parents=True, exist_ok=True)
     pixels = np.round(np.clip(image, 0, 1) * 255).astype(np.uint8)
     options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()} if pixels.ndim == 3 and color_space == "sRGB" else {}
@@ -155,6 +155,6 @@ def seam_quality(image):
 
 
 def repeat_preview(image, count=3):
-    if count not in (1, 2, 3, 5):
-        raise ValueError("重複次數須為 1、2、3、5")
+    if count not in (1, 2, 3, 4, 5):
+        raise ValueError("重複次數須為 1、2、3、4、5")
     return np.tile(image, (count, count, 1))

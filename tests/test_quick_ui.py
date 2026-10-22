@@ -3,9 +3,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import Qt, QPointF, QObject, Signal, QThread
+from PySide6.QtCore import Qt, QPointF, QObject, Signal, QThread, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QSpinBox, QDoubleSpinBox, QPushButton, QColorDialog, QFileDialog
+from PySide6.QtWidgets import QApplication, QSpinBox, QDoubleSpinBox, QPushButton, QColorDialog, QFileDialog, QMessageBox, QLabel, QCheckBox
 from PySide6.QtGui import QColor, QImage
 from texture_studio.ui import Window
 from texture_studio.core import crop_image, load_image, save_image
@@ -105,7 +105,7 @@ def test_selected_pixels_drive_processing_without_modifying_source(desktop):
 
 def test_modes_show_only_primary_numeric_controls(desktop):
     app, window, path, errors = desktop
-    for mode, expected in [(0, 0), (1, 1), (2, 3)]:
+    for mode, expected in [(0, 0), (1, 0), (2, 3)]:
         window.mode.setCurrentIndex(mode)
         app.processEvents()
         controls = [widget for widget in window.findChildren(QSpinBox)+window.findChildren(QDoubleSpinBox) if widget.isVisible()]
@@ -228,7 +228,7 @@ def test_jpeg_export_renders_full_resolution_after_small_preview(desktop, tmp_pa
     assert window.result.shape == (512, 1024, 3)
     target = tmp_path / "成品.png"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
-    window.export()
+    window.save_as()
     wait_render(app, window, errors)
     assert not target.exists()
     with Image.open(target.with_suffix(".jpg")) as image:
@@ -257,8 +257,10 @@ def test_removed_actions_are_absent_from_desktop(desktop):
     app, window, path, errors = desktop
     labels = {button.text() for button in window.findChildren(QPushButton)}
     assert "截圖匯入素材" in labels
-    assert "輸出 JPEG 圖片" in labels
-    assert not labels.intersection({"輸出全部", "儲存專案", "開啟專案", "儲存專案 JSON", "開啟專案 JSON"})
+    assert "儲存檔案" in labels
+    assert not labels.intersection({"輸出 JPEG 圖片", "輸出全部", "儲存專案", "開啟專案", "儲存專案 JSON", "開啟專案 JSON"})
+    assert not {widget.text() for widget in window.findChildren(QCheckBox)}.intersection({"原圖比較", "接縫線"})
+    assert "查看結果" not in {label.text() for label in window.findChildren(QLabel)}
 
 
 def test_undo_restores_edit_controls_and_export_matches_restored_result(desktop, tmp_path, monkeypatch):
@@ -277,7 +279,7 @@ def test_undo_restores_edit_controls_and_export_matches_restored_result(desktop,
     np.testing.assert_array_equal(window.result, before)
     target = tmp_path / "復原後.jpg"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
-    window.export()
+    window.save_as()
     wait_render(app, window, errors)
     with Image.open(target) as image:
         np.testing.assert_allclose(np.asarray(image).mean(axis=(0, 1))/255, before.mean(axis=(0, 1)), atol=.01)
@@ -292,7 +294,7 @@ def test_export_waits_for_active_preview_and_uses_latest_controls(desktop, tmp_p
     window.material_brightness.setValue(-50)
     target = tmp_path / "最新調整.jpg"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
-    window.export()
+    window.save_as()
     assert window._pending_export is not None
     wait_render(app, window, errors)
     with Image.open(target) as image:
@@ -370,3 +372,179 @@ def test_board_rotation_changes_grain_without_rotating_board_joints(desktop, tmp
     new_grain = after[12:30, 30:220, 0]
     assert np.abs(np.diff(old_grain, axis=0)).mean() < .001
     assert np.abs(np.diff(new_grain, axis=0)).mean() > .003
+
+
+def test_save_confirm_cancel_keeps_original_unchanged(desktop):
+    app, window, path, errors = desktop
+    before = path.read_bytes()
+    seen = []
+    def dismiss():
+        dialog = app.activeModalWidget()
+        assert isinstance(dialog, QMessageBox)
+        seen.append(dialog.text())
+        dialog.button(QMessageBox.Cancel).click()
+    QTimer.singleShot(20, dismiss)
+    window.save_current()
+    assert seen == ["是否覆蓋原檔案？"]
+    assert path.read_bytes() == before
+    assert not errors
+
+
+def test_confirmed_overwrite_saves_full_result_and_does_not_stack_edits(desktop, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    window.set_crop([.2, .25, .8, .75])
+    window.light.setValue(0)
+    window.material_brightness.setValue(-50)
+    QTimer.singleShot(20, lambda: app.activeModalWidget().button(QMessageBox.Yes).click())
+    window.save_current()
+    wait_render(app, window, errors)
+    with Image.open(path) as image:
+        assert image.format == "PNG"
+        assert image.size == (96, 48)
+        first = np.asarray(image).copy()
+    np.testing.assert_allclose(first.mean(axis=(0, 1))/255, [.2, .25, .3], atol=1/255)
+    monkeypatch.setattr(window, "confirm_save", lambda path: QMessageBox.Yes)
+    window.save_current()
+    wait_render(app, window, errors)
+    with Image.open(path) as image:
+        np.testing.assert_array_equal(np.asarray(image), first)
+    window.material_brightness.setValue(0)
+    wait_render(app, window, errors)
+    np.testing.assert_allclose(window.result.mean(axis=(0, 1)), [.4, .5, .6], atol=1/255)
+
+
+def test_no_on_overwrite_question_saves_jpeg_copy(desktop, tmp_path, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    before = path.read_bytes()
+    target = tmp_path / "另存副本.jpg"
+    monkeypatch.setattr(window, "confirm_save", lambda path: QMessageBox.No)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_current()
+    wait_render(app, window, errors)
+    assert path.read_bytes() == before
+    with Image.open(target) as image:
+        assert image.format == "JPEG"
+
+
+def test_missing_original_can_be_saved_from_imported_pixels(desktop, tmp_path, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    window.set_crop([.2, .25, .8, .75])
+    window.light.setValue(0)
+    path.unlink()
+    target = tmp_path / "原檔消失後.jpg"
+    monkeypatch.setattr(window, "confirm_save", lambda path: pytest.fail("missing originals must use Save As"))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_current()
+    wait_render(app, window, errors)
+    with Image.open(target) as image:
+        assert image.size == (96, 48)
+    assert not path.exists()
+
+
+def test_deleted_jpeg_can_be_restored_to_its_original_path(desktop, tmp_path, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    target = tmp_path / "已刪除的原圖.jpg"
+    save_image(np.full((24, 40, 3), .3, "float32"), target)
+    window.add_paths([str(target)])
+    window.assets.setCurrentRow(1)
+    wait_render(app, window, errors)
+    target.unlink()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_current()
+    wait_render(app, window, errors)
+    with Image.open(target) as image:
+        assert image.format == "JPEG"
+        assert image.size == (40, 24)
+
+
+def test_screen_capture_uses_save_as_instead_of_overwriting_temp_file(desktop, tmp_path, monkeypatch):
+    app, window, path, errors = desktop
+    shot = QImage(32, 24, QImage.Format_RGB888)
+    shot.fill(QColor(80, 120, 160))
+    window.import_capture(shot)
+    wait_render(app, window, errors)
+    source = window.current_path()
+    from pathlib import Path
+    before = Path(source).read_bytes()
+    target = tmp_path / "螢幕素材.jpg"
+    monkeypatch.setattr(window, "confirm_save", lambda path: pytest.fail("captures have no persistent original"))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_current()
+    wait_render(app, window, errors)
+    assert target.is_file()
+    assert Path(source).read_bytes() == before
+
+
+def test_right_click_resets_each_requested_slider(desktop):
+    app, window, path, errors = desktop
+    window.mode.setCurrentIndex(1)
+    for name, changed, default in [("material_saturation", 30, 100), ("material_brightness", 50, 0),
+                                    ("material_scale", 230, 100), ("material_angle", 70, 0), ("variation", 80, 20)]:
+        control = getattr(window, name)
+        control.setValue(changed)
+        QTest.mouseClick(control.slider, Qt.RightButton, pos=control.slider.rect().center())
+        assert control.value() == default
+        assert str(default) in control.label.text()
+    wait_render(app, window, errors)
+
+
+def test_four_by_four_and_fill_cover_preview_without_changing_output(desktop):
+    app, window, path, errors = desktop
+    window.set_crop([.2, .25, .8, .75])
+    window.light.setValue(0)
+    window.process()
+    wait_render(app, window, errors)
+    before = window.result.copy()
+    window.repeat.setCurrentText("4")
+    assert window.repeat.currentText() == "4"
+    window.fill_button.setChecked(True)
+    app.processEvents()
+    assert window.preview.fill_mode
+    for size in [(700, 500), (930, 700)]:
+        window.resize(*size)
+        window.preview.horizontalScrollBar().setValue(100000)
+        window.preview.verticalScrollBar().setValue(-100000)
+        app.processEvents()
+        frame = window.preview.viewport().grab().toImage()
+        for x, y in [(3, 3), (frame.width()-4, 3), (3, frame.height()-4), (frame.width()-4, frame.height()-4)]:
+            color = frame.pixelColor(x, y)
+            np.testing.assert_allclose([color.red(), color.green(), color.blue()], [.4*255, .5*255, .6*255], atol=2)
+    np.testing.assert_array_equal(before, window.result)
+    window.fill_button.setChecked(False)
+    assert not window.preview.fill_mode
+
+
+def test_fill_draws_repeated_texture_not_a_solid_background(desktop):
+    app, window, path, errors = desktop
+    pattern = np.full((32, 32, 3), [1., .2, .1], "float32")
+    pattern[:, 16:] = [.1, .2, 1.]
+    view = window.preview
+    view.show_image(pattern, 4, fill=True)
+    app.processEvents()
+    for pan in (0, 100000):
+        view.horizontalScrollBar().setValue(pan)
+        view._recenter_fill()
+        app.processEvents()
+        frame = view.viewport().grab().toImage()
+        period = view._fill_period
+        for x, expected in [(.25, [255, 51, 25]), (1.25, [255, 51, 25]), (.75, [25, 51, 255])]:
+            point = view.mapFromScene(QPointF(period.x()*x, period.y()*.25))
+            color = frame.pixelColor(point)
+            np.testing.assert_allclose([color.red(), color.green(), color.blue()], expected, atol=1)
+
+
+def test_removing_last_asset_clears_filled_preview(desktop):
+    app, window, path, errors = desktop
+    window.fill_button.setChecked(True)
+    app.processEvents()
+    assert window.preview.fill_mode
+    window.remove_asset()
+    app.processEvents()
+    assert not window.preview.fill_mode
+    assert window.preview._tile_brush is None
+    assert window.preview.source_shape == (0, 0)
+    assert window.result is None

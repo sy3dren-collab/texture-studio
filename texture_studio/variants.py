@@ -20,8 +20,8 @@ def generate_variants(image, count=4, seed=42, direction=True, mirror=False,
         brightness=.05, hue=.01, saturation=.05, contrast=.05, translate=True,
         arbitrary_angle=False, progress=lambda value: None):
     validate(image)
-    if not 2 <= count <= 50:
-        raise ValueError("變體數量必須介於 2 與 50")
+    if not 1 <= count <= 50:
+        raise ValueError("變體數量必須介於 1 與 50")
     if any(not 0 <= v <= 1 for v in (brightness, hue, saturation, contrast)):
         raise ValueError("變化強度必須介於 0 與 1")
     rng = np.random.default_rng(seed)

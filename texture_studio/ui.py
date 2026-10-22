@@ -3,13 +3,14 @@ from pathlib import Path
 import tempfile
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QRectF, QPointF, QTimer
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QIcon, QPen
+from PySide6.QtGui import QImage, QPixmap, QColor, QIcon, QPen, QBrush, QTransform
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QLabel, QFileDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
     QComboBox, QCheckBox, QMessageBox, QProgressBar, QGraphicsView, QGraphicsScene, QScrollArea, QSlider, QColorDialog)
 from .core import load_image, save_image, correct_lighting, seamless, repeat_preview, crop_image
 from .appearance import adjust_material
 from .capture import ScreenCapture
+from .storage import file_signature, replace_source
 from . import __version__
 
 
@@ -26,6 +27,10 @@ class Preview(QGraphicsView):
         self._drag = None
         self.image_bounds = QRectF()
         self.source_shape = (0, 0)
+        self.fill_mode = False
+        self._tile_brush = None
+        self._fill_count = None
+        self._fill_period = QPointF(256, 256)
 
     def set_crop_mode(self, enabled):
         self.crop_mode = enabled
@@ -34,30 +39,62 @@ class Preview(QGraphicsView):
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self.viewport().update()
 
+    def clear_image(self):
+        self.fill_mode = False
+        self._tile_brush = None
+        self._crop_rect = None
+        self.image_bounds = QRectF()
+        self.source_shape = (0, 0)
+        self.scene().clear()
+        self.viewport().update()
+
     def wheelEvent(self, event):
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         if .03 < self.transform().m11() * factor < 50:
             self.scale(factor, factor)
 
-    def show_image(self, image, count, guides=False, region=None):
+    def show_image(self, image, count, region=None, fill=False):
         # Limit interactive preview memory, retain full resolution result for export.
         import cv2
         h, w = image.shape[:2]
         self.source_shape = (h, w)
+        was_fill = self.fill_mode
+        self.fill_mode = bool(fill and not self.crop_mode)
         if self.crop_mode:
             count = 1
+        if self.fill_mode:
+            ratio = min(1, 1600/max(h, w))
+            small = cv2.resize(image, (max(1, round(w*ratio)), max(1, round(h*ratio))))
+            pixels = np.ascontiguousarray(np.clip(small, 0, 1)*255, dtype="uint8")
+            qimage = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
+            pixmap = QPixmap.fromImage(qimage)
+            unit = 256/max(pixmap.width(), pixmap.height())
+            period = QPointF(pixmap.width()*unit, pixmap.height()*unit)
+            refit = not was_fill or self._fill_count != count or abs(period.x()/period.y()-self._fill_period.x()/self._fill_period.y()) > .01
+            self._tile_brush = QBrush(pixmap)
+            self._tile_brush.setTransform(QTransform.fromScale(unit, unit))
+            self._fill_period, self._fill_count = period, count
+            self.scene().clear()
+            self.scene().setSceneRect(-1e7, -1e7, 2e7, 2e7)
+            self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._crop_rect = None
+            if refit:
+                self.resetTransform()
+                factor = min(max(1, self.viewport().width()-4)/(period.x()*count),
+                             max(1, self.viewport().height()-4)/(period.y()*count))
+                self.scale(factor, factor)
+                self.centerOn(period.x()*count/2, period.y()*count/2)
+            self.viewport().update()
+            return
+        self._tile_brush = None
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         ratio = min(1, 1600 / (max(h, w) * count))
         small = cv2.resize(image, (max(1, round(w * ratio)), max(1, round(h * ratio))))
         pixels = (np.clip(repeat_preview(small, count), 0, 1) * 255).astype("uint8")
         qimage = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(qimage)
-        if guides and count > 1:
-            painter = QPainter(pixmap)
-            painter.setPen(QColor("#ff4655"))
-            for i in range(1, count):
-                painter.drawLine(i * small.shape[1], 0, i * small.shape[1], pixels.shape[0])
-                painter.drawLine(0, i * small.shape[0], pixels.shape[1], i * small.shape[0])
-            painter.end()
         self.scene().clear()
         self.scene().addPixmap(pixmap)
         self.scene().setSceneRect(pixmap.rect())
@@ -66,6 +103,19 @@ class Preview(QGraphicsView):
                                 (region[2]-region[0])*small.shape[1], (region[3]-region[1])*small.shape[0])
                            if region is not None and self.crop_mode else None)
         self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+
+    def drawBackground(self, painter, rect):
+        if self.fill_mode and self._tile_brush is not None:
+            painter.fillRect(rect, self._tile_brush)
+        else:
+            painter.fillRect(rect, self.palette().base())
+
+    def _recenter_fill(self):
+        if self.fill_mode:
+            center = self.mapToScene(self.viewport().rect().center())
+            # Moving by whole periods leaves the view unchanged and prevents
+            # repeated drags from ever approaching the scene's scroll limits.
+            self.centerOn(center.x()%self._fill_period.x(), center.y()%self._fill_period.y())
 
     def _bounded_point(self, position):
         point = self.mapToScene(position)
@@ -110,7 +160,9 @@ class Preview(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if not self.crop_mode or event.button() != Qt.LeftButton or not self._drag:
-            return super().mouseReleaseEvent(event)
+            super().mouseReleaseEvent(event)
+            self._recenter_fill()
+            return
         # Some platforms deliver no intermediate move event for short drags.
         self.mouseMoveEvent(event)
         self._drag = None
@@ -146,14 +198,31 @@ class Preview(QGraphicsView):
             painter.drawRect(QRectF(point.x()-size/2, point.y()-size/2, size, size))
 
 
+class ResetSlider(QSlider):
+    def __init__(self, default_value):
+        super().__init__(Qt.Horizontal)
+        self.default_value = default_value
+        self.setToolTip(f"按滑鼠右鍵恢復預設值 {default_value}")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.setValue(self.default_value)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        event.accept()
+
+
 class PercentControl(QWidget):
     valueChanged = Signal(int)
 
-    def __init__(self, value=85, minimum=0, maximum=100, suffix="%"):
+    def __init__(self, value=85, minimum=0, maximum=100, suffix="%", resettable=False):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = ResetSlider(value) if resettable else QSlider(Qt.Horizontal)
         self.slider.setRange(minimum, maximum)
         self.label = QLabel()
         self.slider.valueChanged.connect(lambda current: self.label.setText(f"{current}{suffix}"))
@@ -210,6 +279,9 @@ class Window(QMainWindow):
         self._closing = False
         self.processed_settings = None
         self.original = self.result = None
+        self.original_path = None
+        self._working_sources = {}
+        self._capture_paths = set()
         self.outputs = []
         self.thread = None
         self.dirty = False
@@ -245,6 +317,9 @@ class Window(QMainWindow):
         self.capture_button.clicked.connect(self.start_capture)
         left.addWidget(self.capture_button)
         self.button(left, "匯入圖片", self.import_images)
+        self.save_button = QPushButton("儲存檔案")
+        self.save_button.clicked.connect(self.save_current)
+        left.addWidget(self.save_button)
         self.button(left, "移除素材", self.remove_asset)
         self.info = QLabel("先匯入圖片，再按一鍵製圖")
         self.info.setWordWrap(True)
@@ -261,7 +336,7 @@ class Window(QMainWindow):
         source_tools.addWidget(self.full_image_button)
         source_tools.addStretch()
         center.addLayout(source_tools)
-        self.crop_hint = QLabel("框選後，僅使用範圍內的素材製作貼圖；不修改原始檔")
+        self.crop_hint = QLabel("框選後僅使用範圍內的素材製圖；完成後按「儲存檔案」")
         self.crop_hint.setWordWrap(True)
         center.addWidget(self.crop_hint)
         self.preview = Preview()
@@ -270,16 +345,17 @@ class Window(QMainWindow):
         preview_tools = QHBoxLayout()
         preview_tools.addWidget(QLabel("預覽"))
         self.repeat = QComboBox()
-        self.repeat.addItems(["1", "2", "3", "5"])
+        self.repeat.addItems(["1", "2", "3", "4", "5"])
         self.repeat.setCurrentText("3")
         preview_tools.addWidget(self.repeat)
-        self.compare = QCheckBox("原圖比較")
-        self.guides = QCheckBox("接縫線")
-        preview_tools.addWidget(self.compare)
-        preview_tools.addWidget(self.guides)
+        self.fill_button = QPushButton("全屏")
+        self.fill_button.setCheckable(True)
+        self.fill_button.setToolTip("將目前貼圖重複鋪滿上方檢視區；拖曳平移、滾輪縮放")
+        self.fill_button.toggled.connect(self.toggle_fill)
+        preview_tools.addWidget(self.fill_button)
         preview_tools.addStretch()
         center.addLayout(preview_tools)
-        self.metrics = QLabel("匯入 → 選範圍 → 一鍵製圖 → 輸出")
+        self.metrics = QLabel("匯入 → 選範圍 → 一鍵製圖 → 儲存檔案")
         center.addWidget(self.metrics)
         self.progress = QProgressBar()
         center.addWidget(self.progress)
@@ -289,10 +365,10 @@ class Window(QMainWindow):
         right.addRow("製圖模式", self.mode)
         self.light = PercentControl(85)
         right.addRow("去暗角／陰影", self.light)
-        self.material_saturation = PercentControl(100, 0, 200)
+        self.material_saturation = PercentControl(100, 0, 200, resettable=True)
         self.material_saturation.setToolTip("100% 保留原飽和度，0% 轉為灰階")
         right.addRow("飽和度", self.material_saturation)
-        self.material_brightness = PercentControl(0, -100, 100)
+        self.material_brightness = PercentControl(0, -100, 100, resettable=True)
         self.material_brightness.setToolTip("0% 保留原明暗；向右變亮，向左變暗")
         right.addRow("明暗度", self.material_brightness)
         color_tools = QWidget()
@@ -305,14 +381,13 @@ class Window(QMainWindow):
         color_layout.addWidget(self.color_button)
         color_layout.addWidget(self.clear_color_button)
         right.addRow("素材顏色", color_tools)
-        self.material_scale = PercentControl(100, 25, 400)
+        self.material_scale = PercentControl(100, 25, 400, resettable=True)
         self.material_scale.setToolTip("100% 原始大小；200% 紋路放大兩倍，輸出圖片尺寸不變")
         right.addRow("素材縮放", self.material_scale)
-        self.material_angle = PercentControl(0, -180, 180, "°")
+        self.material_angle = PercentControl(0, -180, 180, "°", resettable=True)
         self.material_angle.setToolTip("以單張素材中心旋轉紋路，不旋轉整面木地板排列")
         right.addRow("旋轉角度", self.material_angle)
-        self.variant_count = self.number(right, "生成張數", 4, 2, 50, True)
-        self.variation = PercentControl(20)
+        self.variation = PercentControl(20, resettable=True)
         right.addRow("變化程度", self.variation)
         self.direction = QCheckBox("保留木紋方向")
         self.direction.setChecked(True)
@@ -334,28 +409,23 @@ class Window(QMainWindow):
         self.size_hint = QLabel("自動保留比例；木地板整面尺寸自動計算")
         self.size_hint.setWordWrap(True)
         right.addRow(self.size_hint)
-        self.selection = QComboBox()
-        right.addRow("查看結果", self.selection)
         self.shuffle_button = QPushButton("換一組排列")
         self.shuffle_button.clicked.connect(self.reshuffle)
         right.addRow(self.shuffle_button)
         for text, function in [("一鍵製圖", self.process), ("取消", self.cancel),
-                ("回到上次結果", self.undo), ("輸出 JPEG 圖片", self.export)]:
+                ("回到上次結果", self.undo)]:
             button = QPushButton(text)
             button.clicked.connect(function)
             right.addRow(button)
         self.assets.currentRowChanged.connect(self.select_asset)
         self.repeat.currentTextChanged.connect(self.refresh)
-        self.compare.toggled.connect(self.refresh)
-        self.guides.toggled.connect(self.refresh)
-        self.selection.currentIndexChanged.connect(self.select_output)
         self.mode.currentIndexChanged.connect(self.update_mode)
         self.board_width.valueChanged.connect(self.update_board_limits)
         self.board_length.valueChanged.connect(self.update_board_limits)
         for control in (self.light, self.material_saturation, self.material_brightness,
                         self.material_scale, self.material_angle, self.variation):
             control.valueChanged.connect(self.request_preview)
-        for control in (self.board_width, self.board_length, self.gap, self.variant_count):
+        for control in (self.board_width, self.board_length, self.gap):
             control.valueChanged.connect(self.request_preview)
         for control in (self.mode, self.pattern, self.resolution):
             control.currentIndexChanged.connect(self.request_preview)
@@ -428,6 +498,7 @@ class Window(QMainWindow):
         if image.isNull() or min(image.width(), image.height()) < 4 or not image.save(str(path), "PNG"):
             self.error("截圖無效或無法儲存")
             return
+        self._capture_paths.add(str(path))
         self.add_paths([str(path)])
         index = self.paths.index(str(path))
         if self.assets.currentRow() != index:
@@ -435,7 +506,7 @@ class Window(QMainWindow):
 
     def update_mode(self, *_):
         mode = self.mode.currentIndex()
-        for widget in (self.variant_count, self.variation, self.direction):
+        for widget in (self.variation, self.direction):
             self.quick_form.setRowVisible(widget, mode == 1)
         for widget in (self.pattern, self.board_width, self.board_length, self.gap):
             self.quick_form.setRowVisible(widget, mode == 2)
@@ -452,6 +523,12 @@ class Window(QMainWindow):
             self.seed_value = (self.seed_value+1) % 2147483647
             self.process()
 
+    def toggle_fill(self, enabled):
+        self.fill_button.setText("返回預覽" if enabled else "全屏")
+        if enabled:
+            self.crop_button.setChecked(False)
+        self.refresh()
+
     def current_path(self):
         index = self.assets.currentRow()
         return self.paths[index] if 0 <= index < len(self.paths) else None
@@ -463,7 +540,7 @@ class Window(QMainWindow):
             self._generation += 1
         self.preview.set_crop_mode(enabled)
         self.crop_hint.setText("拖曳框選範圍；框內拖曳移動，四角調整大小；按一鍵製圖套用" if enabled else
-                              "框選後，僅使用範圍內的素材製作貼圖；不修改原始檔")
+                              "框選後僅使用範圍內的素材製圖；完成後按「儲存檔案」")
         self.refresh()
 
     def set_crop(self, region):
@@ -540,6 +617,8 @@ class Window(QMainWindow):
         if index >= 0:
             path = self.paths.pop(index)
             self.regions.pop(path, None)
+            self._working_sources.pop(path, None)
+            self._capture_paths.discard(path)
             self.weights.pop(index)
             self.assets.blockSignals(True)
             self.assets.takeItem(index)
@@ -555,24 +634,28 @@ class Window(QMainWindow):
                 self.preview_timer.stop()
                 self._pending_preview = False
                 self._source_cache.clear()
-                self.selection.clear()
-                self.preview.scene().clear()
+                self.original_path = None
+                self._working_sources.clear()
+                self.preview.clear_image()
                 self.info.setText("先匯入圖片，再按一鍵製圖")
 
     def select_asset(self, index):
         if not 0 <= index < len(self.paths):
             return
         path = self.paths[index]
-        self.run_job(lambda progress: load_image(path), self.loaded)
+        self._generation += 1
+        self.save_button.setEnabled(False)
+        self.run_job(lambda progress: self._working_sources[path] if path in self._working_sources else load_image(path),
+                     lambda image: self.loaded(image, path))
 
-    def loaded(self, image):
+    def loaded(self, image, path=None):
         self.original = image
+        self.original_path = path or self.current_path()
         self.result = image
         self.outputs = []
         self.previous_outputs = []
         self._previous_snapshot = None
         self.processed_settings = None
-        self.selection.clear()
         self.update_source_info()
         pixels = (image[::max(1, image.shape[0]//96), ::max(1, image.shape[1]//96)]*255).astype("uint8").copy()
         thumbnail = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
@@ -597,7 +680,7 @@ class Window(QMainWindow):
         output_w, output_h = max(4, round(source_w*factor)), max(4, round(source_h*factor))
         amount = self.variation.value()/100
         data = {"mode": mode, "light": self.light.value()/100, "radius": .1, "contrast": .7,
-                "blend": 1, "seed": self.seed_value, "variant_count": self.variant_count.value(),
+                "blend": 1, "seed": self.seed_value, "variant_count": 1,
                 "board_width": width, "board_length": length, "gap": self.gap.value(),
                 "world_width": length*4, "world_height": width*12,
                 "min_length": length*.5, "max_length": length*4/3, "bevel": 1, "offset": .5,
@@ -615,15 +698,25 @@ class Window(QMainWindow):
         return data
 
     def snapshot(self):
+        baselines = self._working_sources.copy()
+        if self.original is not None and self.original_path == self.current_path():
+            baselines[self.current_path()] = self.original
         return {"settings": self.settings(), "inputs": self.paths.copy(), "weights": self.weights.copy(),
                 "regions": {path: region.copy() for path, region in self.regions.items()},
-                "index": max(0, self.assets.currentRow()), "generation": self._generation}
+                "index": max(0, self.assets.currentRow()), "generation": self._generation,
+                "source_baselines": baselines}
 
-    def prepared_source(self, path, region, strength):
-        stat = Path(path).stat()
-        key = (path, stat.st_mtime_ns, stat.st_size, tuple(region) if region else None, strength)
+    def prepared_source(self, path, region, strength, baselines):
+        baseline = baselines.get(path)
+        try:
+            signature = file_signature(path)
+        except FileNotFoundError:
+            if baseline is None:
+                raise
+            signature = None
+        key = (path, signature, id(baseline) if baseline is not None else None, tuple(region) if region else None, strength)
         if key not in self._source_cache:
-            image = crop_image(load_image(path), region)
+            image = crop_image(baseline if baseline is not None else load_image(path), region)
             image = seamless(correct_lighting(image, strength))
             while len(self._source_cache) >= 4:
                 self._source_cache.pop(next(iter(self._source_cache)))
@@ -654,7 +747,6 @@ class Window(QMainWindow):
             settings["width"] = max(4, round(settings["width"]*ratio))
             settings["height"] = max(4, round(settings["height"]*ratio))
         self.crop_button.setChecked(False)
-        self.compare.setChecked(False)
 
         def appearance(image):
             return adjust_material(image, settings["material_saturation"], settings["material_brightness"],
@@ -663,7 +755,7 @@ class Window(QMainWindow):
         def operation(progress):
             import cv2
             if settings["mode"] != 2:
-                image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"])
+                image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"], snapshot["source_baselines"])
                 progress(25)
                 size = (settings["width"], settings["height"])
                 if (image.shape[1], image.shape[0]) != size:
@@ -682,7 +774,7 @@ class Window(QMainWindow):
                 from .boards import BoardSettings, generate_boards
                 images = []
                 for i, path in enumerate(paths):
-                    image = self.prepared_source(path, regions.get(path), settings["light"])
+                    image = self.prepared_source(path, regions.get(path), settings["light"], snapshot["source_baselines"])
                     if preview and max(image.shape[:2]) > 1024:
                         factor = 1024/max(image.shape[:2])
                         image = cv2.resize(image, (max(4, round(image.shape[1]*factor)), max(4, round(image.shape[0]*factor))),
@@ -699,27 +791,28 @@ class Window(QMainWindow):
                 outputs = [("base_color", result["base_color"])]
             if export_request:
                 progress(97)
-                name = export_request["output_name"]
-                if name == "base_color" and settings["mode"] == 1:
-                    name = outputs[0][0]
-                selected = next((image for key, image in outputs if key == name), None)
-                if selected is None:
-                    raise ValueError("這個變體已不在目前結果中，請重新選擇後輸出")
-                self.export_to(export_request["path"], selected, name, paths)
+                name, selected = outputs[0]
+                if export_request.get("overwrite"):
+                    replace_source(selected, export_request["path"], export_request["signature"])
+                else:
+                    self.export_to(export_request["path"], selected, name, paths)
             return outputs
 
         def completed(outputs):
+            if export_request and export_request.get("overwrite"):
+                path = export_request["path"]
+                self._working_sources[path] = snapshot["source_baselines"][path]
             if snapshot["generation"] == self._generation:
                 previous = self.processed_settings
                 self.processed(outputs)
                 self._previous_snapshot = previous
                 self.processed_settings = snapshot
                 if preview:
-                    self.metrics.setText("調整預覽 · JPEG 輸出會使用所選的完整解析度")
+                    self.metrics.setText("調整預覽 · 儲存時會使用所選的完整解析度")
             else:
                 self._pending_preview = True
             if export_request:
-                self.metrics.setText(f"已輸出 JPEG：{Path(export_request['path']).name}")
+                self.metrics.setText(f"已儲存：{Path(export_request['path']).name}")
         self.run_job(operation, completed)
 
     def run_job(self, operation, callback):
@@ -761,6 +854,7 @@ class Window(QMainWindow):
         self.crop_button.setEnabled(True)
         self.full_image_button.setEnabled(True)
         self.capture_button.setEnabled(True)
+        self.save_button.setEnabled(True)
         if self._pending_export is not None:
             request, self._pending_export = self._pending_export, None
             QTimer.singleShot(0, lambda: self.process(export_request=request))
@@ -783,19 +877,11 @@ class Window(QMainWindow):
             self.thread.requestInterruption()
 
     def processed(self, outputs):
-        selected_name = self.selection.currentData()
         self.previous_outputs = self.outputs
         self.outputs = outputs
         self.dirty = True
-        self.selection.clear()
-        labels = {"base_color": "完成貼圖", "gap_mask": "板縫遮罩", "height_reference": "高度參考圖",
-                  "roughness_reference": "粗糙度參考圖", "normal_reference": "法線參考圖"}
-        for name, _ in outputs:
-            label = f"變體 {int(name.split('_')[-1])+1}" if name.startswith("variant_") else labels.get(name, name)
-            self.selection.addItem(label, name)
-        selected_index = self.selection.findData(selected_name)
-        self.selection.setCurrentIndex(max(0, selected_index))
-        self.select_output(max(0, selected_index))
+        self.result = outputs[0][1]
+        self.refresh()
 
     def undo(self):
         if not self.previous_outputs or self.thread or self._previous_snapshot is None:
@@ -816,7 +902,7 @@ class Window(QMainWindow):
             color = QColor.fromRgbF(*self.tint_color) if self.tint_color else None
             self.color_button.setText(color.name() if color else "上色…")
             self.color_button.setStyleSheet(f"border: 2px solid {color.name()};" if color else "")
-            for name in ("board_width", "board_length", "gap", "variant_count", "variation"):
+            for name in ("board_width", "board_length", "gap", "variation"):
                 getattr(self, name).setValue(settings[name])
             self.direction.setChecked(settings["direction"])
             self.pattern.setCurrentIndex(self.pattern.findData(settings["pattern"]))
@@ -831,43 +917,76 @@ class Window(QMainWindow):
         self._previous_snapshot = old_snapshot
         self.update_source_info()
 
-    def select_output(self, index):
-        if 0 <= index < len(self.outputs):
-            self.result = self.outputs[index][1]
-            self.refresh()
-
     def refresh(self, *_):
         editing = self.crop_button.isChecked()
-        image = self.original if self.compare.isChecked() or editing else self.result
+        image = self.original if editing else self.result
         if image is None:
             return
         if image.ndim == 2:
             image = np.repeat(image[..., None], 3, axis=2)
-        self.preview.show_image(image, int(self.repeat.currentText()), self.guides.isChecked(), self.regions.get(self.current_path()))
+        self.preview.show_image(image, int(self.repeat.currentText()), self.regions.get(self.current_path()), self.fill_button.isChecked())
         self.metrics.setText("正在選取原圖範圍" if editing else
-                             "原圖比較" if self.compare.isChecked() else
-                             "可用重複預覽檢查接縫，再輸出圖片")
+                             "貼圖已鋪滿檢視區 · 拖曳平移、滾輪縮放" if self.fill_button.isChecked() else
+                             "可用重複預覽檢查接縫，再按「儲存檔案」")
 
-    def export(self):
+    def confirm_save(self, path):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("儲存檔案")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setText("是否覆蓋原檔案？")
+        dialog.setInformativeText(str(path))
+        dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        dialog.button(QMessageBox.Yes).setText("覆蓋原檔")
+        dialog.button(QMessageBox.No).setText("另存 JPEG")
+        dialog.button(QMessageBox.Cancel).setText("取消")
+        dialog.setDefaultButton(QMessageBox.No)
+        return dialog.exec()
+
+    def save_current(self):
+        if self.result is None or self.current_path() is None:
+            self.error("請先匯入圖片")
+            return
+        path = self.current_path()
+        writable_format = Path(path).suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+        if path not in self._capture_paths and writable_format and Path(path).is_file():
+            answer = self.confirm_save(path)
+            if answer == QMessageBox.Yes:
+                try:
+                    signature = file_signature(path)
+                    snapshot = self.snapshot()
+                    if path not in snapshot["source_baselines"]:
+                        raise ValueError("請等待原圖載入完成後再儲存")
+                except (OSError, ValueError) as error:
+                    self.error(str(error))
+                    return
+                request = {"path": path, "snapshot": snapshot, "signature": signature, "overwrite": True}
+                self.preview_timer.stop()
+                self.process(export_request=request)
+            elif answer == QMessageBox.No:
+                self.save_as()
+        else:
+            self.save_as()
+
+    def save_as(self):
         if self.result is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "輸出 JPEG 圖片", "texture.jpg", "JPEG 圖片 (*.jpg *.jpeg)")
+        path, _ = QFileDialog.getSaveFileName(self, "儲存檔案 — 另存 JPEG", "texture.jpg", "JPEG 圖片 (*.jpg *.jpeg)")
         if path:
             destination = Path(path)
             if destination.suffix.lower() not in {".jpg", ".jpeg"}:
                 destination = destination.with_suffix(".jpg")
                 if destination.exists() and QMessageBox.question(self, "覆寫 JPEG", f"{destination.name} 已存在，是否覆寫？") != QMessageBox.Yes:
                     return
-            request = {"path": str(destination), "output_name": self.selection.currentData() or "base_color", "snapshot": self.snapshot()}
+            request = {"path": str(destination), "snapshot": self.snapshot()}
             self.preview_timer.stop()
             self.process(export_request=request)
 
     def export_to(self, path, image, output_name=None, source_paths=None):
         if Path(path).suffix.lower() not in {".jpg", ".jpeg"}:
             raise ValueError("請使用 .jpg 或 .jpeg 輸出")
-        if Path(path).resolve() in {Path(source).resolve() for source in (source_paths if source_paths is not None else self.paths)}:
+        if Path(path).is_file() and Path(path).resolve() in {Path(source).resolve() for source in (source_paths if source_paths is not None else self.paths)}:
             raise ValueError("不可覆寫原始素材")
-        selected = output_name or self.selection.currentData()
+        selected = output_name
         is_data = selected in ("normal_reference", "roughness_reference", "height_reference", "gap_mask")
         save_image(image, path, color_space="linear" if is_data else "sRGB")
 
