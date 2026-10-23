@@ -1,5 +1,6 @@
 """UI-independent RGB image processing. Arrays are float32 sRGB in [0, 1]."""
 from pathlib import Path
+from functools import lru_cache
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
@@ -18,17 +19,35 @@ def load_image(path):
         return np.asarray(image.convert("RGB"), dtype=np.float32) / 255
 
 
-def save_image(image, path, color_space="sRGB"):
+@lru_cache(maxsize=1)
+def _srgb_profile():
     from PIL import ImageCms
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def save_image(image, path, color_space="sRGB", repeat=1):
     path = Path(path)
     if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
         raise ValueError("圖片格式必須是 PNG、JPG、TIFF 或 BMP")
+    if not isinstance(repeat, int) or repeat not in (1, 2, 3, 4, 5):
+        raise ValueError("重複次數須為 1、2、3、4、5")
+    h, w = image.shape[:2]
+    if w*h*repeat*repeat > 160_000_000:
+        raise ValueError("鋪排後超過 1.6 億像素，請降低單張素材大小或預覽數量")
     path.parent.mkdir(parents=True, exist_ok=True)
     pixels = np.round(np.clip(image, 0, 1) * 255).astype(np.uint8)
-    options = {"icc_profile": ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()} if pixels.ndim == 3 and color_space == "sRGB" else {}
+    options = {"icc_profile": _srgb_profile()} if pixels.ndim == 3 and color_space == "sRGB" else {}
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         options.update(quality=95, subsampling=0)
-    Image.fromarray(pixels).save(path, **options)
+    tile = Image.fromarray(pixels)
+    if repeat > 1:
+        # Paste quantized tiles; avoid a repeated float32 RGB canvas (4x RAM).
+        canvas = Image.new(tile.mode, (w*repeat, h*repeat))
+        for row in range(repeat):
+            for column in range(repeat):
+                canvas.paste(tile, (column*w, row*h))
+        tile = canvas
+    tile.save(path, **options)
 
 
 def validate(image):
@@ -92,14 +111,14 @@ def _illumination(log_image, radius, preserve_contrast):
     return surface+smooth
 
 
-def correct_lighting(image, strength=0.85, radius=0.1, preserve_contrast=0.7, color=False):
+def correct_lighting(image, strength=0.85, radius=0.1, preserve_contrast=0.7, color=False, passes=2):
     """Correct vignettes/gradients on a bounded working image; retain RGB detail.
 
     A single RGB image cannot uniquely separate material color from lighting.
     Strength zero is an exact bypass; gains are limited to avoid extreme noise.
     """
     validate(image)
-    if not 0 <= strength <= 1 or not 0.01 <= radius <= 0.5 or not 0 <= preserve_contrast <= 1:
+    if not 0 <= strength <= 1 or not 0.01 <= radius <= 0.5 or not 0 <= preserve_contrast <= 1 or passes not in (1, 2):
         raise ValueError("光照參數超出範圍")
     if strength == 0:
         return image.copy()
@@ -110,10 +129,13 @@ def correct_lighting(image, strength=0.85, radius=0.1, preserve_contrast=0.7, co
     log = np.log(np.maximum(luminance, 1/4096))
     channels = []
     for channel in range(log.shape[2]):
-        field = _illumination(log[..., channel], radius, preserve_contrast)
-        # Use the well-lit portion as reference, instead of retaining a darkened
-        # overall mean when most corners are underexposed.
-        gain_log = np.clip(strength*(np.percentile(field, 75)-field), -np.log(4), np.log(4))
+        gain_log = np.zeros(log.shape[:2], dtype="float32")
+        # Re-estimate the residual after the first correction, instead of
+        # multiplying one gain by two and turning shadows into bright bands.
+        for _ in range(passes):
+            field = _illumination(log[..., channel]+gain_log, radius, preserve_contrast)
+            correction = strength*(np.percentile(field, 75)-field)
+            gain_log = np.clip(gain_log+correction, -np.log(4), np.log(4))
         channels.append(cv2.resize(gain_log, (w, h), interpolation=cv2.INTER_LINEAR))
     gain = np.exp(np.stack(channels, axis=2))
     if not color:

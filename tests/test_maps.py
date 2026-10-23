@@ -18,3 +18,12 @@ def test_gap_height_and_normal_variation():
     normal = maps["normal_reference"]*2-1
     np.testing.assert_allclose(np.linalg.norm(normal, axis=2), 1, atol=1e-6)
     assert np.std(normal[..., 0]) > 0
+
+
+def test_reference_normal_uses_same_opengl_y_direction_as_bump_editor():
+    y, x = np.mgrid[:64, :96]
+    height = (.5+.1*np.sin(2*np.pi*y/64)).astype("float32")
+    image = np.repeat(height[..., None], 3, axis=2)
+    normal = derive_maps(image, height=height)["normal_reference"]
+    assert normal[0, 20, 1] > .5
+    np.testing.assert_allclose(normal[..., 0], .5)

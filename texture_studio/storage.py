@@ -12,7 +12,7 @@ def file_signature(path):
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
 
 
-def replace_source(image, path, expected_signature):
+def replace_source(image, path, expected_signature, repeat=1):
     validate(image)
     target = Path(path).resolve(strict=True)
     if file_signature(target) != expected_signature:
@@ -23,10 +23,10 @@ def replace_source(image, path, expected_signature):
     temporary = Path(temporary_name)
     try:
         # Keep the source intact until a complete, decodable image is ready.
-        save_image(image, temporary)
+        save_image(image, temporary, repeat=repeat)
         with Image.open(temporary) as check:
             check.load()
-            if check.size != (image.shape[1], image.shape[0]):
+            if check.size != (image.shape[1]*repeat, image.shape[0]*repeat):
                 raise OSError("儲存圖片尺寸不符，未覆蓋原檔")
         os.chmod(temporary, original_mode)
         if file_signature(target) != expected_signature:

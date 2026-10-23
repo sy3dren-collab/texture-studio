@@ -38,6 +38,7 @@ def wait_render(app, window, errors):
 def desktop(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = Window()
+    window.repeat.setCurrentText("1")
     errors = []
     window.error = errors.append
     source = np.full((96, 160, 3), [.4, .5, .6], dtype="float32")
@@ -548,3 +549,312 @@ def test_removing_last_asset_clears_filled_preview(desktop):
     assert window.preview._tile_brush is None
     assert window.preview.source_shape == (0, 0)
     assert window.result is None
+
+
+def test_all_slider_defaults_are_centered_and_keep_original_ranges(desktop):
+    app, window, path, errors = desktop
+    for name, default, low, high in [("light", 85, 0, 100), ("material_saturation", 100, 0, 200),
+                                     ("material_brightness", 0, -100, 100), ("material_scale", 100, 25, 400),
+                                     ("material_angle", 0, -180, 180), ("variation", 20, 0, 100),
+                                     ("shift_x", 20, 0, 100), ("shift_y", 20, 0, 100)]:
+        control = getattr(window, name)
+        middle = (control.slider.minimum()+control.slider.maximum())//2
+        assert control.slider.value() == middle
+        assert control.value() == default
+        control.slider.setValue(control.slider.minimum())
+        assert control.value() == low
+        control.slider.setValue(control.slider.maximum())
+        assert control.value() == high
+        for value in range(low, high+1):
+            control.setValue(value)
+            assert control.value() == value
+        QTest.mouseClick(control.slider, Qt.RightButton, pos=control.slider.rect().center())
+        assert control.slider.value() == middle
+        assert control.value() == default
+    wait_render(app, window, errors)
+
+
+def test_stagger_controls_edit_preview_save_and_undo(desktop, tmp_path, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    for mode in (0, 2):
+        window.mode.setCurrentIndex(mode)
+        assert not window.shift_x.isVisible() and not window.shift_y.isVisible()
+    window.mode.setCurrentIndex(1)
+    assert window.shift_x.isVisible() and window.shift_y.isVisible()
+    y, x = np.mgrid[:96, :160]
+    source = np.stack((.5+.15*np.sin(2*np.pi*x/160), .5+.15*np.cos(2*np.pi*y/96),
+                       np.full(x.shape, .4)), axis=-1).astype("float32")
+    source_path = tmp_path / "交錯素材.png"
+    save_image(source, source_path)
+    window.add_paths([str(source_path)])
+    window.assets.setCurrentRow(1)
+    wait_render(app, window, errors)
+    window.light.setValue(0)
+    window.variation.setValue(0)
+    window.shift_x.setValue(0)
+    window.shift_y.setValue(0)
+    wait_render(app, window, errors)
+    base = window.result.copy()
+    window.shift_x.setValue(50)
+    window.shift_y.setValue(25)
+    wait_render(app, window, errors)
+    shifted = window.result.copy()
+    assert not np.allclose(base, shifted)
+    assert window.processed_settings["settings"]["shift_x"] == .5
+    assert window.processed_settings["settings"]["shift_y"] == .25
+    window.undo()
+    assert window.shift_x.value() == window.shift_y.value() == 0
+    np.testing.assert_array_equal(window.result, base)
+    window.undo()
+    np.testing.assert_array_equal(window.result, shifted)
+    target = tmp_path / "交錯結果.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    with Image.open(target) as image:
+        assert image.size == (160, 96)
+        decoded = np.asarray(image)/255
+        assert np.abs(decoded-shifted).mean() < .006
+    reference = tmp_path / "預期交錯結果.jpg"
+    save_image(shifted, reference)
+    assert target.read_bytes() == reference.read_bytes()
+
+
+def test_save_variant_changes_continues_as_full_resolution_material(desktop, tmp_path, monkeypatch):
+    app, window, path, errors = desktop
+    original_bytes = path.read_bytes()
+    window.mode.setCurrentIndex(1)
+    window.set_crop([.1, .1, .9, .9])
+    window.material_brightness.setValue(-30)
+    window.shift_x.setValue(40)
+    window.shift_y.setValue(65)
+    window.resolution.setCurrentIndex(window.resolution.findData(2048))
+    wait_render(app, window, errors)
+    assert window.primary_button.text() == "儲存變更"
+    assert window.result.shape[1] == 1024
+    captured = []
+    apply = window.apply_variant
+    def observe(image, snapshot):
+        captured.append(image.copy())
+        apply(image, snapshot)
+    monkeypatch.setattr(window, "apply_variant", observe)
+    QTest.mouseClick(window.primary_button, Qt.LeftButton)
+    wait_render(app, window, errors)
+    assert window.mode.currentIndex() == 0
+    assert window.primary_button.text() == "一鍵製圖"
+    assert window.result.shape[1] == 2048
+    assert len(captured) == 1
+    np.testing.assert_array_equal(window.original, captured[0])
+    np.testing.assert_array_equal(window.result, captured[0])
+    assert str(path) not in window.regions
+    assert window.material_brightness.value() == 0
+    assert window.light.value() == 0
+    assert window.resolution.currentData() is None
+    assert path.read_bytes() == original_bytes
+    # Neutral processing and another adjustment operate on the accepted image.
+    window.process()
+    wait_render(app, window, errors)
+    np.testing.assert_array_equal(window.result, captured[0])
+    window.material_brightness.setValue(-50)
+    wait_render(app, window, errors)
+    target = tmp_path / "接續編輯.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    reference = tmp_path / "預期接續編輯.jpg"
+    save_image(captured[0]*.5, reference)
+    assert target.read_bytes() == reference.read_bytes()
+    assert path.read_bytes() == original_bytes
+
+
+def test_variant_changes_queued_during_preview_use_latest_sliders(desktop, monkeypatch):
+    from texture_studio.ui import Worker
+    app, window, path, errors = desktop
+    window.mode.setCurrentIndex(1)
+    wait_render(app, window, errors)
+    window.process(preview=True)
+    assert window.thread is not None
+    window.shift_x.setValue(75)
+    window.shift_y.setValue(15)
+    accepted = []
+    apply = window.apply_variant
+    def observe(image, snapshot):
+        accepted.append(snapshot["settings"])
+        apply(image, snapshot)
+    monkeypatch.setattr(window, "apply_variant", observe)
+    window.primary_action()
+    assert not window.mode.isEnabled()
+    wait_render(app, window, errors)
+    assert accepted[0]["shift_x"] == .75
+    assert accepted[0]["shift_y"] == .15
+    assert window.mode.currentIndex() == 0
+    assert window.mode.isEnabled() and window.save_button.isEnabled()
+    assert not window._applying_variant
+
+
+def test_cancelling_pending_variant_changes_keeps_working_source(desktop):
+    app, window, path, errors = desktop
+    window.mode.setCurrentIndex(1)
+    wait_render(app, window, errors)
+    source = window.original.copy()
+    window.process(preview=True)
+    window.primary_action()
+    assert window._applying_variant
+    window.cancel()
+    wait_render(app, window, errors)
+    assert window.mode.currentIndex() == 1
+    assert window.mode.isEnabled()
+    assert not window._applying_variant
+    np.testing.assert_array_equal(window.original, source)
+    assert str(path) not in window._working_sources
+
+
+def test_clone_paints_all_repeats_wraps_undoes_and_saves(desktop, tmp_path, monkeypatch):
+    app, window, path, errors = desktop
+    original_bytes = path.read_bytes()
+    window.light.setValue(0)
+    window.process()
+    wait_render(app, window, errors)
+    QTest.mouseClick(window.clone_button, Qt.LeftButton)
+    wait_render(app, window, errors)
+    assert window.preview.clone_mode and not window.mode.isEnabled()
+    before = window.result.copy()
+    window.repeat.setCurrentText("2")
+    window.clone_size.setValue(12)
+    window.clone_opacity.setValue(100)
+    view = window.preview
+    period = view._view_period
+    source = view.mapFromScene(QPointF(period.x()*.5, period.y()*.5))
+    target = view.mapFromScene(QPointF(period.x()-.5, period.y()-.5))
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.AltModifier, source)
+    assert window._clone_source is not None
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+    assert window._clone_stroke is None
+    for y, x in [(0, 0), (0, 159), (95, 0), (95, 159)]:
+        np.testing.assert_allclose(window.result[y, x], [.4, .5, .6], atol=1/255)
+    app.processEvents()
+    frame = view.viewport().grab().toImage()
+    for row in (0, 1):
+        for column in (0, 1):
+            point = view.mapFromScene(QPointF(column*period.x()+1, row*period.y()+1))
+            color = frame.pixelColor(point)
+            np.testing.assert_allclose([color.red(), color.green(), color.blue()], [.4*255, .5*255, .6*255], atol=2)
+    QTest.mouseClick(window.clone_undo_button, Qt.LeftButton)
+    np.testing.assert_array_equal(window.result, before)
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+    painted = window.result.copy()
+    QTest.mouseClick(window.clone_button, Qt.LeftButton)
+    assert not view.clone_mode and window.mode.isEnabled()
+    target_path = tmp_path / "印章修改.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target_path), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    reference = tmp_path / "預期印章.jpg"
+    save_image(painted, reference, repeat=2)
+    assert target_path.read_bytes() == reference.read_bytes()
+    assert path.read_bytes() == original_bytes
+
+
+def test_clone_fill_uses_same_tile_coordinates_and_source_button(desktop):
+    app, window, path, errors = desktop
+    window.light.setValue(0)
+    window.clone_button.setChecked(True)
+    wait_render(app, window, errors)
+    window.fill_button.setChecked(True)
+    window.clone_opacity.setValue(100)
+    window.clone_size.setValue(12)
+    app.processEvents()
+    view = window.preview
+    period = view._view_period
+    window.clone_pick_button.setChecked(True)
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.mapFromScene(QPointF(period.x()*1.5, period.y()*1.5)))
+    assert not window.clone_pick_button.isChecked()
+    before = window.result.copy()
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.mapFromScene(QPointF(period.x()*2-.8, period.y()*2-.8)))
+    assert not np.array_equal(window.result, before)
+    np.testing.assert_allclose(window.result[0, 0], [.4, .5, .6], atol=1/255)
+
+
+def test_bump_mode_opens_independent_full_resolution_editor(desktop):
+    from test_bump_ui import wait_bump
+    app, window, path, errors = desktop
+    original = window.original.copy()
+    window.resolution.setCurrentIndex(window.resolution.findData(2048))
+    wait_render(app, window, errors)
+    preview = window.result.copy()
+    window.mode.setCurrentIndex(3)
+    wait_render(app, window, errors)
+    assert window.mode.currentIndex() == 0
+    assert len(window.bump_windows) == 1
+    dialog = window.bump_windows[0]
+    bump_errors = []
+    dialog.error = bump_errors.append
+    wait_bump(app, dialog, bump_errors)
+    assert dialog.source.shape[1] == 2048
+    dialog.brightness.setValue(30)
+    dialog.contrast.setValue(180)
+    wait_bump(app, dialog, bump_errors)
+    np.testing.assert_array_equal(window.original, original)
+    np.testing.assert_array_equal(window.result, preview)
+    dialog.close()
+    app.processEvents()
+    assert not window.bump_windows
+
+
+def test_light_dark_brush_size_opacity_wrap_undo_and_tool_switch(desktop):
+    app, window, path, errors = desktop
+    original_bytes = path.read_bytes()
+    window.set_crop([.2, .25, .8, .75])
+    window.light.setValue(0)
+    window.material_brightness.setValue(-50)
+    window.dodge_button.setChecked(True)
+    wait_render(app, window, errors)
+    assert window.preview.brush_kind == "dodge"
+    assert window.dodge_mode.isVisible() and not window.clone_pick_button.isVisible()
+    window.clone_size.setValue(16)
+    window.clone_opacity.setValue(50)
+    view = window.preview
+    period = view._view_period
+    target = view.mapFromScene(QPointF(period.x()-.5, period.y()-.5))
+    base = window.result.copy()
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+    np.testing.assert_allclose(window.result[0, 0], base[0, 0]*1.5, atol=1e-6)
+    np.testing.assert_array_equal(window.result[24, 48], base[24, 48])
+    QTest.mouseClick(window.clone_undo_button, Qt.LeftButton)
+    np.testing.assert_array_equal(window.result, base)
+    window.dodge_mode.setCurrentIndex(1)
+    window.clone_size.setValue(8)
+    QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=target)
+    np.testing.assert_allclose(window.result[0, 0], base[0, 0]*.75, atol=1e-6)
+    np.testing.assert_array_equal(window.result[5, 5], base[5, 5])
+    dark = window.result.copy()
+    window.clone_button.setChecked(True)
+    assert not window.dodge_button.isChecked()
+    assert window.preview.brush_kind == "clone"
+    assert window.clone_pick_button.isVisible() and not window.dodge_mode.isVisible()
+    np.testing.assert_array_equal(window.result, dark)
+    window.clone_button.setChecked(False)
+    assert window.mode.isEnabled()
+    assert path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_saved_image_matches_visible_repeat_count(desktop, tmp_path, monkeypatch, count):
+    from PIL import Image
+    app, window, path, errors = desktop
+    window.light.setValue(0)
+    window.repeat.setCurrentText(str(count))
+    target = tmp_path / f"預覽{count}x{count}.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    # Subsequent view changes must not alter the captured save request.
+    window.repeat.setCurrentText("1")
+    wait_render(app, window, errors)
+    with Image.open(target) as image:
+        assert image.size == (160*count, 96*count)
+        pixels = np.asarray(image)
+        for row in range(count):
+            for column in range(count):
+                center = pixels[row*96+48, column*160+80]/255
+                np.testing.assert_allclose(center, [.4, .5, .6], atol=.015)

@@ -51,3 +51,14 @@ def test_invalid_render_never_replaces_source(tmp_path):
     with pytest.raises(ValueError, match="無效數值"):
         replace_source(np.full((16, 24, 3), np.nan, "float32"), path, file_signature(path))
     assert path.read_bytes() == before
+
+
+def test_confirmed_replacement_saves_whole_preview_grid(tmp_path):
+    path = tmp_path / "整張預覽.png"
+    tile = np.random.default_rng(42).random((24, 40, 3), dtype=np.float32)
+    save_image(tile, path)
+    replace_source(tile, path, file_signature(path), repeat=3)
+    with Image.open(path) as image:
+        assert image.size == (120, 72)
+        expected = np.tile(np.round(tile*255).astype("uint8"), (3, 3, 1))
+        np.testing.assert_array_equal(np.asarray(image), expected)

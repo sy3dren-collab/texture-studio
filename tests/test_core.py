@@ -88,3 +88,28 @@ def test_default_pipeline_removes_repeated_bottom_shadow_band():
     before = np.std(np.log(shaded/material))
     after = np.std(np.log(np.maximum(output, 1e-6)/material))
     assert after < before*.2
+
+
+@pytest.mark.parametrize("kind", ["vignette", "bottom_shadow", "side_gradient"])
+def test_two_pass_lighting_reduces_residual_shadow_without_erasing_texture(kind):
+    y, x = np.mgrid[-1:1:256j, -1:1:192j]
+    material = .55+.035*np.sin(20*np.pi*x)*np.cos(17*np.pi*y)
+    illumination = {"vignette": np.exp(-.6*(x*x+y*y)),
+                    "bottom_shadow": .3+.7/(1+np.exp((y-.65)*14)),
+                    "side_gradient": .35+.65*(x+1)/2}[kind]
+    image = np.repeat((material*illumination)[..., None], 3, axis=2).astype("float32")
+    single = correct_lighting(image, passes=1)[..., 0]
+    double = correct_lighting(image)[..., 0]
+    error = lambda output: np.std(np.log(np.maximum(output, 1e-6)/material))
+    assert error(double) < error(single)*.6
+    detail = np.std(np.diff(double[60:180, 60:130], axis=1))
+    assert detail > .8*np.std(np.diff(material[60:180, 60:130], axis=1))
+    assert np.isfinite(double).all() and double.max() < 1
+
+
+def test_excessive_repeated_export_is_rejected_before_allocating_canvas(tmp_path):
+    image = np.broadcast_to(np.array([.2, .4, .6], dtype="float32"), (8192, 8192, 3))
+    target = tmp_path / "過大的鋪排.jpg"
+    with pytest.raises(ValueError, match="1.6 億像素"):
+        save_image(image, target, repeat=2)
+    assert not target.exists()

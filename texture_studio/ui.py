@@ -2,267 +2,18 @@
 from pathlib import Path
 import tempfile
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QRectF, QPointF, QTimer
-from PySide6.QtGui import QImage, QPixmap, QColor, QIcon, QPen, QBrush, QTransform
+from PySide6.QtCore import QThread, Slot, Qt, QPointF, QTimer
+from PySide6.QtGui import QImage, QPixmap, QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QLabel, QFileDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QComboBox, QCheckBox, QMessageBox, QProgressBar, QGraphicsView, QGraphicsScene, QScrollArea, QSlider, QColorDialog)
-from .core import load_image, save_image, correct_lighting, seamless, repeat_preview, crop_image
+    QComboBox, QCheckBox, QMessageBox, QProgressBar, QScrollArea, QColorDialog)
+from .core import load_image, save_image, correct_lighting, seamless, crop_image
 from .appearance import adjust_material
 from .capture import ScreenCapture
 from .storage import file_signature, replace_source
+from .painting import PeriodicCloneStroke, PeriodicDodgeStroke
+from .widgets import Preview, PercentControl, Worker
 from . import __version__
-
-
-class Preview(QGraphicsView):
-    cropChanged = Signal(object)
-
-    def __init__(self):
-        super().__init__()
-        self.setScene(QGraphicsScene(self))
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.crop_mode = False
-        self._crop_rect = None
-        self._drag = None
-        self.image_bounds = QRectF()
-        self.source_shape = (0, 0)
-        self.fill_mode = False
-        self._tile_brush = None
-        self._fill_count = None
-        self._fill_period = QPointF(256, 256)
-
-    def set_crop_mode(self, enabled):
-        self.crop_mode = enabled
-        self._drag = None
-        self.setDragMode(QGraphicsView.NoDrag if enabled else QGraphicsView.ScrollHandDrag)
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
-        self.viewport().update()
-
-    def clear_image(self):
-        self.fill_mode = False
-        self._tile_brush = None
-        self._crop_rect = None
-        self.image_bounds = QRectF()
-        self.source_shape = (0, 0)
-        self.scene().clear()
-        self.viewport().update()
-
-    def wheelEvent(self, event):
-        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
-        if .03 < self.transform().m11() * factor < 50:
-            self.scale(factor, factor)
-
-    def show_image(self, image, count, region=None, fill=False):
-        # Limit interactive preview memory, retain full resolution result for export.
-        import cv2
-        h, w = image.shape[:2]
-        self.source_shape = (h, w)
-        was_fill = self.fill_mode
-        self.fill_mode = bool(fill and not self.crop_mode)
-        if self.crop_mode:
-            count = 1
-        if self.fill_mode:
-            ratio = min(1, 1600/max(h, w))
-            small = cv2.resize(image, (max(1, round(w*ratio)), max(1, round(h*ratio))))
-            pixels = np.ascontiguousarray(np.clip(small, 0, 1)*255, dtype="uint8")
-            qimage = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
-            pixmap = QPixmap.fromImage(qimage)
-            unit = 256/max(pixmap.width(), pixmap.height())
-            period = QPointF(pixmap.width()*unit, pixmap.height()*unit)
-            refit = not was_fill or self._fill_count != count or abs(period.x()/period.y()-self._fill_period.x()/self._fill_period.y()) > .01
-            self._tile_brush = QBrush(pixmap)
-            self._tile_brush.setTransform(QTransform.fromScale(unit, unit))
-            self._fill_period, self._fill_count = period, count
-            self.scene().clear()
-            self.scene().setSceneRect(-1e7, -1e7, 2e7, 2e7)
-            self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self._crop_rect = None
-            if refit:
-                self.resetTransform()
-                factor = min(max(1, self.viewport().width()-4)/(period.x()*count),
-                             max(1, self.viewport().height()-4)/(period.y()*count))
-                self.scale(factor, factor)
-                self.centerOn(period.x()*count/2, period.y()*count/2)
-            self.viewport().update()
-            return
-        self._tile_brush = None
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        ratio = min(1, 1600 / (max(h, w) * count))
-        small = cv2.resize(image, (max(1, round(w * ratio)), max(1, round(h * ratio))))
-        pixels = (np.clip(repeat_preview(small, count), 0, 1) * 255).astype("uint8")
-        qimage = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0], QImage.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(qimage)
-        self.scene().clear()
-        self.scene().addPixmap(pixmap)
-        self.scene().setSceneRect(pixmap.rect())
-        self.image_bounds = QRectF(0, 0, pixels.shape[1], pixels.shape[0])
-        self._crop_rect = (QRectF(region[0]*small.shape[1], region[1]*small.shape[0],
-                                (region[2]-region[0])*small.shape[1], (region[3]-region[1])*small.shape[0])
-                           if region is not None and self.crop_mode else None)
-        self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
-
-    def drawBackground(self, painter, rect):
-        if self.fill_mode and self._tile_brush is not None:
-            painter.fillRect(rect, self._tile_brush)
-        else:
-            painter.fillRect(rect, self.palette().base())
-
-    def _recenter_fill(self):
-        if self.fill_mode:
-            center = self.mapToScene(self.viewport().rect().center())
-            # Moving by whole periods leaves the view unchanged and prevents
-            # repeated drags from ever approaching the scene's scroll limits.
-            self.centerOn(center.x()%self._fill_period.x(), center.y()%self._fill_period.y())
-
-    def _bounded_point(self, position):
-        point = self.mapToScene(position)
-        return QPointF(np.clip(point.x(), 0, self.image_bounds.width()),
-                       np.clip(point.y(), 0, self.image_bounds.height()))
-
-    def mousePressEvent(self, event):
-        if not self.crop_mode or event.button() != Qt.LeftButton or self.image_bounds.isEmpty():
-            return super().mousePressEvent(event)
-        point = self._bounded_point(event.position().toPoint())
-        self._start_point = point
-        self._start_rect = QRectF(self._crop_rect) if self._crop_rect else None
-        self._anchor = point
-        self._drag = "draw"
-        if self._crop_rect:
-            rect = self._crop_rect
-            corners = [rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()]
-            tolerance = 10/max(self.transform().m11(), .01)
-            for index, corner in enumerate(corners):
-                if (point-corner).manhattanLength() <= tolerance:
-                    self._drag = "resize"
-                    self._anchor = corners[(index+2)%4]
-                    break
-            else:
-                if rect.contains(point):
-                    self._drag = "move"
-        event.accept()
-
-    def mouseMoveEvent(self, event):
-        if not self.crop_mode or not self._drag:
-            return super().mouseMoveEvent(event)
-        point = self._bounded_point(event.position().toPoint())
-        if self._drag == "move":
-            rect = self._start_rect.translated(point-self._start_point)
-            rect.moveLeft(np.clip(rect.left(), 0, self.image_bounds.width()-rect.width()))
-            rect.moveTop(np.clip(rect.top(), 0, self.image_bounds.height()-rect.height()))
-        else:
-            rect = QRectF(self._anchor, point).normalized().intersected(self.image_bounds)
-        self._crop_rect = rect
-        self.viewport().update()
-        event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if not self.crop_mode or event.button() != Qt.LeftButton or not self._drag:
-            super().mouseReleaseEvent(event)
-            self._recenter_fill()
-            return
-        # Some platforms deliver no intermediate move event for short drags.
-        self.mouseMoveEvent(event)
-        self._drag = None
-        rect = self._crop_rect
-        h, w = self.source_shape
-        if rect is None or rect.width()/self.image_bounds.width()*w < 4 or rect.height()/self.image_bounds.height()*h < 4:
-            self._crop_rect = self._start_rect
-        else:
-            self.cropChanged.emit((rect.left()/self.image_bounds.width(), rect.top()/self.image_bounds.height(),
-                                   rect.right()/self.image_bounds.width(), rect.bottom()/self.image_bounds.height()))
-        self.viewport().update()
-        event.accept()
-
-    def drawForeground(self, painter, rect):
-        super().drawForeground(painter, rect)
-        if not self.crop_mode or self._crop_rect is None:
-            return
-        selected, bounds = self._crop_rect, self.image_bounds
-        shade = QColor(0, 0, 0, 125)
-        for area in (QRectF(0, 0, bounds.width(), selected.top()),
-                     QRectF(0, selected.bottom(), bounds.width(), bounds.height()-selected.bottom()),
-                     QRectF(0, selected.top(), selected.left(), selected.height()),
-                     QRectF(selected.right(), selected.top(), bounds.width()-selected.right(), selected.height())):
-            painter.fillRect(area, shade)
-        pen = QPen(QColor("#ffca4f"), 2)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRect(selected)
-        size = 7/max(self.transform().m11(), .01)
-        painter.setBrush(QColor("#ffca4f"))
-        for point in (selected.topLeft(), selected.topRight(), selected.bottomLeft(), selected.bottomRight()):
-            painter.drawRect(QRectF(point.x()-size/2, point.y()-size/2, size, size))
-
-
-class ResetSlider(QSlider):
-    def __init__(self, default_value):
-        super().__init__(Qt.Horizontal)
-        self.default_value = default_value
-        self.setToolTip(f"按滑鼠右鍵恢復預設值 {default_value}")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            self.setValue(self.default_value)
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def contextMenuEvent(self, event):
-        event.accept()
-
-
-class PercentControl(QWidget):
-    valueChanged = Signal(int)
-
-    def __init__(self, value=85, minimum=0, maximum=100, suffix="%", resettable=False):
-        super().__init__()
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.slider = ResetSlider(value) if resettable else QSlider(Qt.Horizontal)
-        self.slider.setRange(minimum, maximum)
-        self.label = QLabel()
-        self.slider.valueChanged.connect(lambda current: self.label.setText(f"{current}{suffix}"))
-        self.slider.valueChanged.connect(self.valueChanged)
-        layout.addWidget(self.slider)
-        layout.addWidget(self.label)
-        self.slider.setValue(value)
-        self.label.setText(f"{self.slider.value()}{suffix}")
-
-    def value(self):
-        return self.slider.value()
-
-    def setValue(self, value):
-        self.slider.setValue(round(value))
-
-
-class Worker(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int)
-    done = Signal()
-
-    def __init__(self, operation):
-        super().__init__()
-        self.operation = operation
-
-    @Slot()
-    def run(self):
-        try:
-            def checkpoint(value):
-                if QThread.currentThread().isInterruptionRequested():
-                    raise InterruptedError("已取消；保留上次結果")
-                self.progress.emit(value)
-            result = self.operation(checkpoint)
-            checkpoint(100)
-            self.finished.emit(result)
-        except Exception as error:
-            self.failed.emit(str(error))
-        finally:
-            self.done.emit()
 
 
 class Window(QMainWindow):
@@ -281,15 +32,20 @@ class Window(QMainWindow):
         self.original = self.result = None
         self.original_path = None
         self._working_sources = {}
+        self._staged_sources = set()
         self._capture_paths = set()
         self.outputs = []
         self.thread = None
-        self.dirty = False
         self.seed_value = 42
         self.tint_color = None
         self._source_cache = {}
         self._pending_preview = False
         self._pending_export = None
+        self._applying_variant = self._active_apply = False
+        self._clone_stroke = self._clone_undo = None
+        self._clone_source = self._clone_offset = None
+        self.bump_windows = []
+        self._last_mode = 0
         self._generation = 0
         self._capture_session = None
         self._capture_temp = None
@@ -334,13 +90,50 @@ class Window(QMainWindow):
         self.full_image_button = QPushButton("恢復整張")
         self.full_image_button.clicked.connect(self.reset_crop)
         source_tools.addWidget(self.full_image_button)
+        self.clone_button = QPushButton("印章畫筆")
+        self.clone_button.setCheckable(True)
+        self.clone_button.toggled.connect(self.toggle_clone)
+        source_tools.addWidget(self.clone_button)
+        self.dodge_button = QPushButton("明暗筆刷")
+        self.dodge_button.setCheckable(True)
+        self.dodge_button.toggled.connect(lambda enabled: self.toggle_clone(enabled, "dodge"))
+        source_tools.addWidget(self.dodge_button)
         source_tools.addStretch()
         center.addLayout(source_tools)
+        self.clone_tools = QWidget()
+        brush_tools = QHBoxLayout(self.clone_tools)
+        brush_tools.setContentsMargins(0, 0, 0, 0)
+        self.clone_pick_button = QPushButton("選取參考點")
+        self.clone_pick_button.setCheckable(True)
+        self.clone_pick_button.toggled.connect(lambda checked: setattr(self.preview, "pick_clone_source", checked))
+        brush_tools.addWidget(self.clone_pick_button)
+        self.dodge_mode = QComboBox()
+        self.dodge_mode.addItems(["刷亮", "刷暗"])
+        brush_tools.addWidget(self.dodge_mode)
+        self.clone_undo_button = QPushButton("復原上一筆")
+        self.clone_undo_button.clicked.connect(self.undo_clone)
+        self.clone_undo_button.setEnabled(False)
+        brush_tools.addWidget(self.clone_undo_button)
+        brush_tools.addWidget(QLabel("大小"))
+        self.clone_size = PercentControl(64, 1, 512, " px", resettable=True)
+        self.clone_size.setToolTip("完整解析度的畫筆直徑；最大以素材短邊為限")
+        self.clone_size.valueChanged.connect(self.update_clone_size)
+        brush_tools.addWidget(self.clone_size, 1)
+        brush_tools.addWidget(QLabel("透明度"))
+        self.clone_opacity = PercentControl(50, resettable=True)
+        self.clone_opacity.setToolTip("0% 不修改，100% 完全複製；同一筆不會因重複經過而加深")
+        brush_tools.addWidget(self.clone_opacity, 1)
+        center.addWidget(self.clone_tools)
+        self.clone_tools.hide()
         self.crop_hint = QLabel("框選後僅使用範圍內的素材製圖；完成後按「儲存檔案」")
         self.crop_hint.setWordWrap(True)
         center.addWidget(self.crop_hint)
         self.preview = Preview()
         self.preview.cropChanged.connect(self.set_crop)
+        self.preview.clonePicked.connect(self.pick_clone)
+        self.preview.cloneStarted.connect(self.begin_clone)
+        self.preview.cloneMoved.connect(self.move_clone)
+        self.preview.cloneEnded.connect(self.finish_clone)
         center.addWidget(self.preview)
         preview_tools = QHBoxLayout()
         preview_tools.addWidget(QLabel("預覽"))
@@ -361,9 +154,9 @@ class Window(QMainWindow):
         center.addWidget(self.progress)
 
         self.mode = QComboBox()
-        self.mode.addItems(["無縫貼圖", "隨機變體", "木地板"])
+        self.mode.addItems(["無縫貼圖", "隨機變體", "木地板", "建立 BUMP"])
         right.addRow("製圖模式", self.mode)
-        self.light = PercentControl(85)
+        self.light = PercentControl(85, resettable=True)
         right.addRow("去暗角／陰影", self.light)
         self.material_saturation = PercentControl(100, 0, 200, resettable=True)
         self.material_saturation.setToolTip("100% 保留原飽和度，0% 轉為灰階")
@@ -389,6 +182,12 @@ class Window(QMainWindow):
         right.addRow("旋轉角度", self.material_angle)
         self.variation = PercentControl(20, resettable=True)
         right.addRow("變化程度", self.variation)
+        self.shift_x = PercentControl(20, resettable=True)
+        self.shift_y = PercentControl(20, resettable=True)
+        self.shift_x.setToolTip("每張素材各自隨機左右位移；數值是最大幅度，100% 為一張素材寬，0% 不位移；右鍵恢復 20%")
+        self.shift_y.setToolTip("每張素材各自隨機上下位移；數值是最大幅度，100% 為一張素材高，0% 不位移；右鍵恢復 20%")
+        right.addRow("X 軸隨機位移", self.shift_x)
+        right.addRow("Y 軸隨機位移", self.shift_y)
         self.direction = QCheckBox("保留木紋方向")
         self.direction.setChecked(True)
         right.addRow(self.direction)
@@ -405,14 +204,17 @@ class Window(QMainWindow):
         self.resolution = QComboBox()
         for label, value in [("自動（保留比例）", None), ("1K · 快速", 1024), ("2K", 2048), ("4K", 4096), ("8K", 8192)]:
             self.resolution.addItem(label, value)
-        right.addRow("輸出大小", self.resolution)
+        right.addRow("單張素材大小", self.resolution)
         self.size_hint = QLabel("自動保留比例；木地板整面尺寸自動計算")
         self.size_hint.setWordWrap(True)
         right.addRow(self.size_hint)
         self.shuffle_button = QPushButton("換一組排列")
         self.shuffle_button.clicked.connect(self.reshuffle)
         right.addRow(self.shuffle_button)
-        for text, function in [("一鍵製圖", self.process), ("取消", self.cancel),
+        self.primary_button = QPushButton("一鍵製圖")
+        self.primary_button.clicked.connect(self.primary_action)
+        right.addRow(self.primary_button)
+        for text, function in [("取消", self.cancel),
                 ("回到上次結果", self.undo)]:
             button = QPushButton(text)
             button.clicked.connect(function)
@@ -423,13 +225,18 @@ class Window(QMainWindow):
         self.board_width.valueChanged.connect(self.update_board_limits)
         self.board_length.valueChanged.connect(self.update_board_limits)
         for control in (self.light, self.material_saturation, self.material_brightness,
-                        self.material_scale, self.material_angle, self.variation):
+                        self.material_scale, self.material_angle, self.variation, self.shift_x, self.shift_y):
             control.valueChanged.connect(self.request_preview)
         for control in (self.board_width, self.board_length, self.gap):
             control.valueChanged.connect(self.request_preview)
-        for control in (self.mode, self.pattern, self.resolution):
+        for control in (self.pattern, self.resolution):
             control.currentIndexChanged.connect(self.request_preview)
         self.direction.toggled.connect(self.request_preview)
+        self.edit_controls = (self.mode, self.light, self.material_saturation, self.material_brightness,
+                              self.material_scale, self.material_angle, self.variation, self.shift_x, self.shift_y,
+                              self.color_button, self.clear_color_button, self.direction, self.pattern,
+                              self.board_width, self.board_length, self.gap, self.resolution, self.shuffle_button,
+                              self.primary_button)
         self.update_mode()
 
     def choose_color(self):
@@ -506,13 +313,218 @@ class Window(QMainWindow):
 
     def update_mode(self, *_):
         mode = self.mode.currentIndex()
-        for widget in (self.variation, self.direction):
+        if mode == 3:
+            self.mode.blockSignals(True)
+            self.mode.setCurrentIndex(self._last_mode)
+            self.mode.blockSignals(False)
+            self.open_bump()
+            return
+        self._last_mode = mode
+        self.primary_button.setText("儲存變更" if mode == 1 else "一鍵製圖")
+        for widget in (self.variation, self.direction, self.shift_x, self.shift_y):
             self.quick_form.setRowVisible(widget, mode == 1)
         for widget in (self.pattern, self.board_width, self.board_length, self.gap):
             self.quick_form.setRowVisible(widget, mode == 2)
         self.quick_form.setRowVisible(self.shuffle_button, mode != 0)
         self.shuffle_button.setText("換一組變體" if mode == 1 else "換一組排列")
-        self.size_hint.setText("整面尺寸自動計算；自動輸出為 1K" if mode == 2 else "依選取範圍保留比例；自動使用原始解析度")
+        self.size_hint.setText("單張整面自動為 1K；存檔依預覽數量鋪排" if mode == 2 else "單張保留原始比例；存檔依預覽數量鋪排")
+        self.request_preview()
+
+    def open_bump(self):
+        if self.original is None or self.original_path != self.current_path():
+            self.error("請先匯入圖片，並等待載入完成")
+            return
+        if self._pending_export is not None or self._applying_variant:
+            self.error("正在儲存，請稍候")
+            return
+        request = {"snapshot": self.snapshot(), "bump": True}
+        self.lock_variant(True)
+        self.preview_timer.stop()
+        self.process(export_request=request)
+
+    def show_bump(self, image, snapshot):
+        from .bump_ui import BumpDialog
+        source = snapshot["inputs"][snapshot["index"]]
+        dialog = BumpDialog(image, source, self, snapshot["inputs"])
+        self.bump_windows.append(dialog)
+        dialog.finished.connect(lambda _: self.bump_windows.remove(dialog))
+        dialog.show()
+
+    def primary_action(self):
+        if self.mode.currentIndex() != 1:
+            self.process()
+            return
+        self.prepare_material()
+
+    def prepare_material(self, clone=False):
+        if self.original is None or self.original_path != self.current_path():
+            self.error("請先匯入圖片，並等待載入完成")
+            return False
+        if self._pending_export is not None or self._applying_variant:
+            self.error("正在儲存，請稍候")
+            return False
+        request = {"snapshot": self.snapshot(), "apply_variant": True, "clone": clone}
+        self.lock_variant(True)
+        self.preview_timer.stop()
+        self.process(export_request=request)
+        return True
+
+    def lock_variant(self, locked):
+        self._applying_variant = locked
+        for control in self.edit_controls:
+            control.setEnabled(not locked and not self.preview.clone_mode)
+        self.save_button.setEnabled(not locked)
+
+    def toggle_clone(self, enabled, kind="clone"):
+        button = self.dodge_button if kind == "dodge" else self.clone_button
+        if enabled:
+            other = self.clone_button if kind == "dodge" else self.dodge_button
+            other.setChecked(False)
+            # Switching tools on the accepted working material needs no render.
+            if self.preview.clone_mode:
+                self.finish_clone()
+                self.activate_clone(kind)
+                self.lock_variant(False)
+            elif not self.prepare_material(clone=kind):
+                button.setChecked(False)
+        else:
+            other = self.clone_button if kind == "dodge" else self.dodge_button
+            if other.isChecked():
+                return
+            self.finish_clone()
+            self.preview.set_clone_mode(False)
+            self.preview.clone_reference = None
+            self._clone_source = self._clone_offset = self._clone_undo = None
+            self.clone_tools.hide()
+            self.clone_pick_button.setChecked(False)
+            self.lock_variant(self._applying_variant)
+            self.crop_button.setEnabled(self.thread is None and not self._applying_variant)
+            self.full_image_button.setEnabled(self.crop_button.isEnabled())
+            self.crop_hint.setText("框選後僅使用範圍內的素材製圖；完成後按「儲存檔案」")
+
+    def activate_clone(self, kind="clone"):
+        self._clone_source = self._clone_offset = self._clone_undo = None
+        self.preview.clone_reference = None
+        self.preview.brush_kind = kind
+        self.preview.set_clone_mode(True)
+        self.clone_tools.show()
+        self.clone_pick_button.setVisible(kind == "clone")
+        self.dodge_mode.setVisible(kind == "dodge")
+        self.clone_undo_button.setEnabled(False)
+        self.update_clone_size()
+        if kind == "dodge":
+            self.crop_hint.setText("選擇刷亮／刷暗後拖曳塗抹；大小與透明度控制範圍及程度；中鍵平移；再按「明暗筆刷」離開")
+            self.metrics.setText("明暗筆刷已就緒，可選擇刷亮或刷暗")
+            self.clone_opacity.setToolTip("0% 不修改，100% 改變一級曝光；同一筆重複經過不累加，另畫一筆可繼續調整")
+        else:
+            self.crop_hint.setText("Alt＋點擊或按「選取參考點」取樣，再拖曳塗抹；中鍵拖曳平移；再按「印章畫筆」離開")
+            self.metrics.setText("印章畫筆已就緒，請先選取參考點")
+            self.clone_opacity.setToolTip("0% 不修改，100% 完全複製；同一筆不會因重複經過而加深")
+
+    def update_clone_size(self, *_):
+        self.preview.clone_diameter = self.clone_size.value()
+        self.preview.viewport().update()
+
+    def pick_clone(self, point):
+        self._clone_source = QPointF(point)
+        self._clone_offset = None
+        self.preview.clone_reference = QPointF(point)
+        self.clone_pick_button.setChecked(False)
+        self.metrics.setText("已選取參考點，可拖曳塗抹；Alt＋點擊重新取樣")
+        self.preview.viewport().update()
+
+    def begin_clone(self, point):
+        if self.thread is not None or self.result is None:
+            return
+        if self.preview.brush_kind == "clone" and self._clone_source is None:
+            self.metrics.setText("請先 Alt＋點擊，或按「選取參考點」後點擊圖面")
+            return
+        h, w = self.result.shape[:2]
+        if self.preview.brush_kind == "dodge":
+            self._clone_stroke = PeriodicDodgeStroke(self.result, self.clone_size.value(), self.clone_opacity.value()/100,
+                                                    lighten=self.dodge_mode.currentIndex() == 0)
+        else:
+            if self._clone_offset is None:
+                self._clone_offset = self._clone_source-point
+            offset = (self._clone_offset.x()*w, self._clone_offset.y()*h)
+            self._clone_stroke = PeriodicCloneStroke(self.result, offset, self.clone_size.value(), self.clone_opacity.value()/100)
+        self.save_button.setEnabled(False)
+        self.clone_undo_button.setEnabled(False)
+        self.move_clone(point)
+
+    def move_clone(self, point):
+        if self._clone_stroke is None:
+            return
+        h, w = self._clone_stroke.image.shape[:2]
+        self._clone_stroke.paint_to((point.x()*w-.5, point.y()*h-.5))
+        self.result = self._clone_stroke.image
+        if self._clone_offset is not None:
+            self.preview.clone_reference = point+self._clone_offset
+        self.show_clone_result()
+
+    def show_clone_result(self):
+        self.preview.show_image(self.result, int(self.repeat.currentText()), fill=self.fill_button.isChecked(), preserve_view=True)
+
+    def finish_clone(self):
+        stroke, self._clone_stroke = self._clone_stroke, None
+        if stroke is None:
+            return
+        if stroke.changed:
+            self._clone_undo = stroke.base
+            self.store_clone_result(stroke.image)
+            self.metrics.setText("筆觸已同步套用全部重複貼圖；可復原上一筆")
+        else:
+            self.result = stroke.base
+        self.save_button.setEnabled(True)
+        self.clone_undo_button.setEnabled(self._clone_undo is not None)
+
+    def store_clone_result(self, image):
+        path = self.current_path()
+        self.original = self.result = image
+        self._working_sources[path] = image
+        self._staged_sources.add(path)
+        self._source_cache.clear()
+        self._generation += 1
+        self.outputs = [("base_color", image)]
+        self.previous_outputs = []
+        self._previous_snapshot = None
+        self.processed_settings = self.snapshot()
+        self.show_clone_result()
+
+    def undo_clone(self):
+        if self._clone_undo is None or self._clone_stroke is not None or self.thread is not None:
+            return
+        image, self._clone_undo = self._clone_undo, None
+        self.store_clone_result(image)
+        self.clone_undo_button.setEnabled(False)
+        self.metrics.setText("已復原上一筆筆觸")
+
+    def apply_variant(self, image, snapshot):
+        path = snapshot["inputs"][snapshot["index"]]
+        self._restoring = True
+        try:
+            self._working_sources[path] = image
+            self._staged_sources.add(path)
+            self._source_cache.clear()
+            self.regions.pop(path, None)
+            self.preview_timer.stop()
+            self._pending_preview = False
+            self._generation += 1
+            # These adjustments have been baked into the new working material.
+            self.light.setValue(0)
+            self.material_saturation.setValue(100)
+            self.material_brightness.setValue(0)
+            self.material_scale.setValue(100)
+            self.material_angle.setValue(0)
+            self.clear_color()
+            self.resolution.setCurrentIndex(0)
+            self.mode.setCurrentIndex(0)
+            self.loaded(image, path)
+            self.outputs = [("base_color", image)]
+            self.processed_settings = self.snapshot()
+            self.metrics.setText("已儲存變更，可繼續修改無縫貼圖；寫入圖片請按「儲存檔案」")
+        finally:
+            self._restoring = False
 
     def update_board_limits(self, *_):
         self.board_length.setMinimum(self.board_width.value())
@@ -548,7 +560,6 @@ class Window(QMainWindow):
         if path is not None:
             self.regions[path] = list(region)
             self._generation += 1
-            self.dirty = True
             self.update_source_info()
 
     def reset_crop(self):
@@ -558,7 +569,6 @@ class Window(QMainWindow):
             self._generation += 1
             self.preview_timer.stop()
             self._pending_preview = False
-            self.dirty = True
             self.update_source_info()
             self.refresh()
 
@@ -599,7 +609,7 @@ class Window(QMainWindow):
         self.add_paths(paths)
 
     def add_paths(self, paths):
-        if self.thread is not None:
+        if self.thread is not None or self._applying_variant:
             self.error("請等待目前運算結束再匯入素材")
             return
         for path in paths:
@@ -611,13 +621,16 @@ class Window(QMainWindow):
             self.assets.setCurrentRow(0)
 
     def remove_asset(self):
-        if self.thread is not None:
+        if self.thread is not None or self._applying_variant:
             return
         index = self.assets.currentRow()
         if index >= 0:
+            self.clone_button.setChecked(False)
+            self.dodge_button.setChecked(False)
             path = self.paths.pop(index)
             self.regions.pop(path, None)
             self._working_sources.pop(path, None)
+            self._staged_sources.discard(path)
             self._capture_paths.discard(path)
             self.weights.pop(index)
             self.assets.blockSignals(True)
@@ -636,6 +649,7 @@ class Window(QMainWindow):
                 self._source_cache.clear()
                 self.original_path = None
                 self._working_sources.clear()
+                self._staged_sources.clear()
                 self.preview.clear_image()
                 self.info.setText("先匯入圖片，再按一鍵製圖")
 
@@ -643,6 +657,8 @@ class Window(QMainWindow):
         if not 0 <= index < len(self.paths):
             return
         path = self.paths[index]
+        self.clone_button.setChecked(False)
+        self.dodge_button.setChecked(False)
         self._generation += 1
         self.save_button.setEnabled(False)
         self.run_job(lambda progress: self._working_sources[path] if path in self._working_sources else load_image(path),
@@ -679,17 +695,16 @@ class Window(QMainWindow):
         factor = (edge or (1024 if mode == 2 else max(source_h, source_w)))/max(source_h, source_w)
         output_w, output_h = max(4, round(source_w*factor)), max(4, round(source_h*factor))
         amount = self.variation.value()/100
-        data = {"mode": mode, "light": self.light.value()/100, "radius": .1, "contrast": .7,
-                "blend": 1, "seed": self.seed_value, "variant_count": 1,
+        data = {"mode": mode, "light": self.light.value()/100, "seed": self.seed_value,
                 "board_width": width, "board_length": length, "gap": self.gap.value(),
                 "world_width": length*4, "world_height": width*12,
-                "min_length": length*.5, "max_length": length*4/3, "bevel": 1, "offset": .5,
+                "min_length": length*.5, "max_length": length*4/3,
                 "brightness": amount*.15, "hue": amount*.05, "saturation": amount*.25,
                 "random_contrast": amount*.25, "direction": self.direction.isChecked(),
-                "mirror": False, "color": False, "periodic": True, "arbitrary": False,
-                "translate": True, "derived": False, "pattern": self.pattern.currentData(),
-                "width": output_w, "height": output_h, "resize_output": edge is not None,
-                "output_size": edge, "variation": self.variation.value(), "quick_ui": True,
+                "pattern": self.pattern.currentData(),
+                "width": output_w, "height": output_h,
+                "output_size": edge, "variation": self.variation.value(),
+                "shift_x": self.shift_x.value()/100, "shift_y": self.shift_y.value()/100,
                 "material_saturation": self.material_saturation.value()/100,
                 "material_brightness": self.material_brightness.value()/100,
                 "material_scale": self.material_scale.value()/100,
@@ -704,9 +719,10 @@ class Window(QMainWindow):
         return {"settings": self.settings(), "inputs": self.paths.copy(), "weights": self.weights.copy(),
                 "regions": {path: region.copy() for path, region in self.regions.items()},
                 "index": max(0, self.assets.currentRow()), "generation": self._generation,
-                "source_baselines": baselines}
+                "source_baselines": baselines, "staged_paths": self._staged_sources.copy(),
+                "repeat_count": int(self.repeat.currentText())}
 
-    def prepared_source(self, path, region, strength, baselines):
+    def prepared_source(self, path, region, strength, baselines, staged_paths=()):
         baseline = baselines.get(path)
         try:
             signature = file_signature(path)
@@ -717,7 +733,8 @@ class Window(QMainWindow):
         key = (path, signature, id(baseline) if baseline is not None else None, tuple(region) if region else None, strength)
         if key not in self._source_cache:
             image = crop_image(baseline if baseline is not None else load_image(path), region)
-            image = seamless(correct_lighting(image, strength))
+            if not (path in staged_paths and region is None and strength == 0):
+                image = seamless(correct_lighting(image, strength))
             while len(self._source_cache) >= 4:
                 self._source_cache.pop(next(iter(self._source_cache)))
             self._source_cache[key] = image
@@ -739,6 +756,7 @@ class Window(QMainWindow):
         self.preview_timer.stop()
         self._pending_preview = False
         snapshot = export_request["snapshot"] if export_request else self.snapshot()
+        self._active_apply = bool(export_request and (export_request.get("apply_variant") or export_request.get("bump")))
         settings = snapshot["settings"].copy()
         paths, weights, regions = snapshot["inputs"], snapshot["weights"], snapshot["regions"]
         index = snapshot["index"]
@@ -755,7 +773,7 @@ class Window(QMainWindow):
         def operation(progress):
             import cv2
             if settings["mode"] != 2:
-                image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"], snapshot["source_baselines"])
+                image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"], snapshot["source_baselines"], snapshot["staged_paths"])
                 progress(25)
                 size = (settings["width"], settings["height"])
                 if (image.shape[1], image.shape[0]) != size:
@@ -765,16 +783,19 @@ class Window(QMainWindow):
                 if settings["mode"] == 0:
                     outputs = [("base_color", image)]
                 else:
-                    from .variants import generate_variants
-                    outputs = [(f"variant_{i:02d}", result) for i, result in enumerate(generate_variants(
-                        image, count=settings["variant_count"], seed=settings["seed"], direction=settings["direction"],
+                    from .variants import generate_variants, stagger_tiles
+                    variants = generate_variants(
+                        image, count=1, seed=settings["seed"], direction=settings["direction"],
                         mirror=False, progress=progress, brightness=settings["brightness"], hue=settings["hue"],
-                        saturation=settings["saturation"], contrast=settings["random_contrast"], translate=True))]
+                        saturation=settings["saturation"], contrast=settings["random_contrast"], translate=True)
+                    outputs = [(f"variant_{i:02d}", stagger_tiles(result, settings["shift_x"], settings["shift_y"],
+                                                               settings["seed"], progress))
+                               for i, result in enumerate(variants)]
             else:
                 from .boards import BoardSettings, generate_boards
                 images = []
                 for i, path in enumerate(paths):
-                    image = self.prepared_source(path, regions.get(path), settings["light"], snapshot["source_baselines"])
+                    image = self.prepared_source(path, regions.get(path), settings["light"], snapshot["source_baselines"], snapshot["staged_paths"])
                     if preview and max(image.shape[:2]) > 1024:
                         factor = 1024/max(image.shape[:2])
                         image = cv2.resize(image, (max(4, round(image.shape[1]*factor)), max(4, round(image.shape[0]*factor))),
@@ -789,16 +810,24 @@ class Window(QMainWindow):
                     bevel_mm=1, brightness=settings["brightness"], mirror=False, weights=tuple(weights), lighting_strength=0)
                 result = generate_boards(images, config, progress=progress)
                 outputs = [("base_color", result["base_color"])]
-            if export_request:
+            if export_request and not (export_request.get("apply_variant") or export_request.get("bump")):
                 progress(97)
-                name, selected = outputs[0]
+                _, selected = outputs[0]
                 if export_request.get("overwrite"):
-                    replace_source(selected, export_request["path"], export_request["signature"])
+                    replace_source(selected, export_request["path"], export_request["signature"], repeat=snapshot["repeat_count"])
                 else:
-                    self.export_to(export_request["path"], selected, name, paths)
+                    self.export_to(export_request["path"], selected, paths, repeat=snapshot["repeat_count"])
             return outputs
 
         def completed(outputs):
+            if export_request and export_request.get("bump"):
+                self.show_bump(outputs[0][1], snapshot)
+                return
+            if export_request and export_request.get("apply_variant"):
+                self.apply_variant(outputs[0][1], snapshot)
+                if export_request.get("clone"):
+                    self.activate_clone(export_request["clone"])
+                return
             if export_request and export_request.get("overwrite"):
                 path = export_request["path"]
                 self._working_sources[path] = snapshot["source_baselines"][path]
@@ -812,7 +841,9 @@ class Window(QMainWindow):
             else:
                 self._pending_preview = True
             if export_request:
-                self.metrics.setText(f"已儲存：{Path(export_request['path']).name}")
+                count = snapshot["repeat_count"]
+                h, w = outputs[0][1].shape[:2]
+                self.metrics.setText(f"已儲存：{Path(export_request['path']).name} · {w*count} × {h*count} px")
         self.run_job(operation, completed)
 
     def run_job(self, operation, callback):
@@ -837,6 +868,10 @@ class Window(QMainWindow):
         self.crop_button.setEnabled(False)
         self.full_image_button.setEnabled(False)
         self.capture_button.setEnabled(False)
+        self.clone_button.setEnabled(False)
+        self.dodge_button.setEnabled(False)
+        self.clone_tools.setEnabled(False)
+        self.preview.clone_suspended = True
         thread.start()
 
     @Slot(object)
@@ -850,14 +885,25 @@ class Window(QMainWindow):
     @Slot()
     def job_done(self):
         self.thread = self.worker = None
-        self.assets.setEnabled(True)
-        self.crop_button.setEnabled(True)
-        self.full_image_button.setEnabled(True)
-        self.capture_button.setEnabled(True)
-        self.save_button.setEnabled(True)
+        if self._active_apply:
+            self._active_apply = False
+            self.lock_variant(False)
+        self.preview.clone_suspended = False
+        self.clone_button.setEnabled(not self._applying_variant)
+        self.dodge_button.setEnabled(not self._applying_variant)
+        self.clone_tools.setEnabled(True)
+        if not self._applying_variant and self.clone_button.isChecked() and not self.preview.clone_mode:
+            self.clone_button.setChecked(False)
+        if not self._applying_variant and self.dodge_button.isChecked() and not self.preview.clone_mode:
+            self.dodge_button.setChecked(False)
+        self.assets.setEnabled(not self._applying_variant)
+        self.crop_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
+        self.full_image_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
+        self.capture_button.setEnabled(not self._applying_variant)
+        self.save_button.setEnabled(not self._applying_variant)
         if self._pending_export is not None:
             request, self._pending_export = self._pending_export, None
-            QTimer.singleShot(0, lambda: self.process(export_request=request))
+            self.process(export_request=request)
         elif self._pending_preview:
             self.preview_timer.start(0)
 
@@ -873,13 +919,14 @@ class Window(QMainWindow):
         self.preview_timer.stop()
         self._pending_preview = False
         self._pending_export = None
+        if self._applying_variant and not self._active_apply:
+            self.lock_variant(False)
         if self.thread:
             self.thread.requestInterruption()
 
     def processed(self, outputs):
         self.previous_outputs = self.outputs
         self.outputs = outputs
-        self.dirty = True
         self.result = outputs[0][1]
         self.refresh()
 
@@ -898,6 +945,8 @@ class Window(QMainWindow):
             for name in ("material_saturation", "material_brightness", "material_scale"):
                 getattr(self, name).setValue(settings[name]*100)
             self.material_angle.setValue(settings["material_angle"])
+            for name in ("shift_x", "shift_y"):
+                getattr(self, name).setValue(settings[name]*100)
             self.tint_color = settings["tint"].copy() if settings["tint"] else None
             color = QColor.fromRgbF(*self.tint_color) if self.tint_color else None
             self.color_button.setText(color.name() if color else "上色…")
@@ -981,14 +1030,12 @@ class Window(QMainWindow):
             self.preview_timer.stop()
             self.process(export_request=request)
 
-    def export_to(self, path, image, output_name=None, source_paths=None):
+    def export_to(self, path, image, source_paths=None, repeat=1):
         if Path(path).suffix.lower() not in {".jpg", ".jpeg"}:
             raise ValueError("請使用 .jpg 或 .jpeg 輸出")
         if Path(path).is_file() and Path(path).resolve() in {Path(source).resolve() for source in (source_paths if source_paths is not None else self.paths)}:
             raise ValueError("不可覆寫原始素材")
-        selected = output_name
-        is_data = selected in ("normal_reference", "roughness_reference", "height_reference", "gap_mask")
-        save_image(image, path, color_space="linear" if is_data else "sRGB")
+        save_image(image, path, repeat=repeat)
 
     def error(self, message):
         QMessageBox.warning(self, "Texture Studio", message)
@@ -1002,6 +1049,10 @@ class Window(QMainWindow):
             self.error("正在取消運算，完成後即可關閉")
             event.ignore()
         else:
+            closed = [dialog.close() for dialog in self.bump_windows.copy()]
+            if not all(closed):
+                event.ignore()
+                return
             self._closing = True
             if self._capture_temp is not None:
                 self._capture_temp.cleanup()

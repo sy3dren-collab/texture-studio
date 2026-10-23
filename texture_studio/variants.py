@@ -4,6 +4,66 @@ import numpy as np
 from .core import seamless, validate
 
 
+def random_tile_offsets(shift_x, shift_y, seed):
+    """Independent offsets in material widths/heights for a 4x4 repeat."""
+    if not np.isfinite([shift_x, shift_y]).all() or not (0 <= shift_x <= 1 and 0 <= shift_y <= 1):
+        raise ValueError("隨機位移幅度必須介於 0% 與 100%")
+    return (np.random.default_rng(seed).uniform(-1, 1, (4, 4, 2))*[shift_x, shift_y]).astype("float32")
+
+
+def stagger_tiles(image, shift_x=0, shift_y=0, seed=42, progress=lambda value: None):
+    """Compose independently jittered material copies on a periodic domain.
+
+    The output contains a 4x4 material unit at every amplitude, so dragging
+    changes positions without changing scale. Each copy moves rigidly. Nearest
+    patches fill gaps with wrapped source samples; narrow feathering softens
+    overlaps. Toroidal distances preserve the same layout across all edges.
+    """
+    validate(image)
+    offsets = random_tile_offsets(shift_x, shift_y, seed).reshape(-1, 2)
+    h, w = image.shape[:2]
+    tile_h, tile_w = max(1, (h+3)//4), max(1, (w+3)//4)
+    tile = cv2.resize(image, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+    rows, columns = np.mgrid[:4, :4]
+    centers = (np.stack((columns, rows), axis=-1).reshape(-1, 2)+.5+offsets) % 4
+    centers = centers.astype("float32")
+    xs = (np.arange(w, dtype="float32")+.5)*(4/w)
+    result = np.empty_like(image)
+    for start in range(0, h, 64):
+        progress(90+int(6*start/h))
+        end = min(h, start+64)
+        ys = (np.arange(start, end, dtype="float32")+.5)*(4/h)
+        shape = (end-start, w)
+        best = np.full(shape, np.inf, dtype="float32")
+        second = best.copy()
+        first_index = np.zeros(shape, dtype="uint8")
+        second_index = first_index.copy()
+        for index, (cx, cy) in enumerate(centers):
+            dx = (xs-cx+2) % 4-2
+            dy = (ys-cy+2) % 4-2
+            distance = dy[:, None]**2+dx[None, :]**2
+            closer = distance < best
+            runner_up = (~closer) & (distance < second)
+            second[closer], second_index[closer] = best[closer], first_index[closer]
+            second[runner_up], second_index[runner_up] = distance[runner_up], index
+            best[closer], first_index[closer] = distance[closer], index
+
+        def sample(indices):
+            center = centers[indices]
+            dx = (xs[None, :]-center[..., 0]+2) % 4-2
+            dy = (ys[:, None]-center[..., 1]+2) % 4-2
+            map_x = ((dx+.5)*tile_w-.5).astype("float32")
+            map_y = ((dy+.5)*tile_h-.5).astype("float32")
+            return cv2.remap(tile, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+        base, neighbor = sample(first_index), sample(second_index)
+        # Only the closest two patches contribute, preventing all-over blur.
+        gap = np.clip((np.sqrt(second)-np.sqrt(best))/.12, 0, 1)
+        weight = (.5*(1-gap*gap*(3-2*gap)))[..., None]
+        result[start:end] = base*(1-weight)+neighbor*weight
+    return result
+
+
 def periodic_rotate(image, angle):
     validate(image)
     if angle % 90 == 0:
