@@ -32,7 +32,7 @@ class Preview(QGraphicsView):
         self.clone_mode = self.clone_suspended = self.pick_clone_source = False
         self.brush_kind = "clone"
         self.clone_diameter = 64
-        self.clone_reference = self._brush_hover = None
+        self._brush_hover = None
         self._cloning = False
         self._pan_start = None
         self.setMouseTracking(True)
@@ -41,7 +41,8 @@ class Preview(QGraphicsView):
         self.clone_mode = enabled
         self._cloning = False
         self.setDragMode(QGraphicsView.NoDrag if enabled else QGraphicsView.ScrollHandDrag)
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self.setCursor(Qt.BlankCursor if enabled else Qt.ArrowCursor)
+        self.viewport().setCursor(Qt.BlankCursor if enabled else Qt.ArrowCursor)
         self.viewport().update()
 
     def set_crop_mode(self, enabled):
@@ -49,6 +50,7 @@ class Preview(QGraphicsView):
         self._drag = None
         self.setDragMode(QGraphicsView.NoDrag if enabled else QGraphicsView.ScrollHandDrag)
         self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self.viewport().setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self.viewport().update()
 
     def clear_image(self):
@@ -139,6 +141,8 @@ class Preview(QGraphicsView):
 
     def mousePressEvent(self, event):
         if self.clone_mode and not self.clone_suspended:
+            self._brush_hover = self.mapToScene(event.position().toPoint())
+            self.viewport().update()
             if event.button() == Qt.MiddleButton:
                 self._pan_start = event.position().toPoint()
                 event.accept()
@@ -242,12 +246,6 @@ class Preview(QGraphicsView):
             h, w = self.source_shape
             radius = min(self.clone_diameter, h, w)/max(1, w)*self._view_period.x()/2
             painter.drawEllipse(self._brush_hover, radius, radius)
-            if self.clone_reference is not None:
-                source = QPointF((self.clone_reference.x()%1+np.floor(self._brush_hover.x()/self._view_period.x()))*self._view_period.x(),
-                                 (self.clone_reference.y()%1+np.floor(self._brush_hover.y()/self._view_period.y()))*self._view_period.y())
-                size = 6/max(self.transform().m11(), .01)
-                painter.drawLine(source-QPointF(size, 0), source+QPointF(size, 0))
-                painter.drawLine(source-QPointF(0, size), source+QPointF(0, size))
         if not self.crop_mode or self._crop_rect is None:
             return
         selected, bounds = self._crop_rect, self.image_bounds
@@ -272,6 +270,11 @@ class Preview(QGraphicsView):
         if not self.fill_mode and not allow_outside and not self.image_bounds.contains(point):
             return None
         return QPointF(point.x()/self._view_period.x(), point.y()/self._view_period.y())
+
+    def leaveEvent(self, event):
+        self._brush_hover = None
+        self.viewport().update()
+        super().leaveEvent(event)
 
 
 class ResetSlider(QSlider):
@@ -308,6 +311,11 @@ class PercentControl(QWidget):
         if resettable:
             self.slider.setToolTip(f"按滑鼠右鍵恢復預設值 {value}{suffix}")
         self.label = QLabel()
+        # Reserve one common width, including signs/units, so all tracks and
+        # their default handles align even when the displayed number changes.
+        metrics = self.fontMetrics()
+        self.label.setFixedWidth(max(metrics.horizontalAdvance(text) for text in ("-180°", "400%", "512 px"))+8)
+        self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.slider.valueChanged.connect(self._position_changed)
         layout.addWidget(self.slider)
         layout.addWidget(self.label)

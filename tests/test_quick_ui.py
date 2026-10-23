@@ -482,9 +482,9 @@ def test_screen_capture_uses_save_as_instead_of_overwriting_temp_file(desktop, t
 
 def test_right_click_resets_each_requested_slider(desktop):
     app, window, path, errors = desktop
-    window.mode.setCurrentIndex(1)
+    window.mode.setCurrentIndex(0)
     for name, changed, default in [("material_saturation", 30, 100), ("material_brightness", 50, 0),
-                                    ("material_scale", 230, 100), ("material_angle", 70, 0), ("variation", 80, 20)]:
+                                    ("material_scale", 230, 100), ("material_angle", 70, 0), ("light", 40, 85)]:
         control = getattr(window, name)
         control.setValue(changed)
         QTest.mouseClick(control.slider, Qt.RightButton, pos=control.slider.rect().center())
@@ -555,7 +555,7 @@ def test_all_slider_defaults_are_centered_and_keep_original_ranges(desktop):
     app, window, path, errors = desktop
     for name, default, low, high in [("light", 85, 0, 100), ("material_saturation", 100, 0, 200),
                                      ("material_brightness", 0, -100, 100), ("material_scale", 100, 25, 400),
-                                     ("material_angle", 0, -180, 180), ("variation", 20, 0, 100),
+                                     ("material_angle", 0, -180, 180),
                                      ("shift_x", 20, 0, 100), ("shift_y", 20, 0, 100)]:
         control = getattr(window, name)
         middle = (control.slider.minimum()+control.slider.maximum())//2
@@ -591,7 +591,6 @@ def test_stagger_controls_edit_preview_save_and_undo(desktop, tmp_path, monkeypa
     window.assets.setCurrentRow(1)
     wait_render(app, window, errors)
     window.light.setValue(0)
-    window.variation.setValue(0)
     window.shift_x.setValue(0)
     window.shift_y.setValue(0)
     wait_render(app, window, errors)
@@ -613,7 +612,7 @@ def test_stagger_controls_edit_preview_save_and_undo(desktop, tmp_path, monkeypa
     window.save_as()
     wait_render(app, window, errors)
     with Image.open(target) as image:
-        assert image.size == (160, 96)
+        assert image.size == (640, 384)
         decoded = np.asarray(image)/255
         assert np.abs(decoded-shifted).mean() < .006
     reference = tmp_path / "預期交錯結果.jpg"
@@ -629,7 +628,7 @@ def test_save_variant_changes_continues_as_full_resolution_material(desktop, tmp
     window.material_brightness.setValue(-30)
     window.shift_x.setValue(40)
     window.shift_y.setValue(65)
-    window.resolution.setCurrentIndex(window.resolution.findData(2048))
+    window.resolution.setCurrentIndex(window.resolution.findData(1024))
     wait_render(app, window, errors)
     assert window.primary_button.text() == "儲存變更"
     assert window.result.shape[1] == 1024
@@ -643,7 +642,7 @@ def test_save_variant_changes_continues_as_full_resolution_material(desktop, tmp
     wait_render(app, window, errors)
     assert window.mode.currentIndex() == 0
     assert window.primary_button.text() == "一鍵製圖"
-    assert window.result.shape[1] == 2048
+    assert window.result.shape[1] == 4096
     assert len(captured) == 1
     np.testing.assert_array_equal(window.original, captured[0])
     np.testing.assert_array_equal(window.result, captured[0])
@@ -858,3 +857,121 @@ def test_saved_image_matches_visible_repeat_count(desktop, tmp_path, monkeypatch
             for column in range(count):
                 center = pixels[row*96+48, column*160+80]/255
                 np.testing.assert_allclose(center, [.4, .5, .6], atol=.015)
+
+
+def test_reset_original_clears_committed_random_brush_crop_and_adjustments(desktop, tmp_path, monkeypatch):
+    app, window, path, errors = desktop
+    original = window.original
+    source_bytes = path.read_bytes()
+    window.material_brightness.setValue(-30)
+    window.material_saturation.setValue(0)
+    window.set_crop([.2, .25, .8, .75])
+    window.mode.setCurrentIndex(1)
+    wait_render(app, window, errors)
+    window.primary_action()
+    wait_render(app, window, errors)
+    window.dodge_button.setChecked(True)
+    wait_render(app, window, errors)
+    window.begin_clone(QPointF(.5, .5))
+    window.finish_clone()
+    assert window.original is not original
+    QTest.mouseClick(window.reset_button, Qt.LeftButton)
+    assert window.mode.currentIndex() == 0
+    np.testing.assert_array_equal(window.result, original)
+    assert window.original.shape == (96, 160, 3)
+    assert not window.regions and not window.preview.clone_mode
+    assert not window.clone_button.isChecked() and not window.dodge_button.isChecked()
+    assert not window.previous_outputs and window._clone_undo is None
+    assert window.tint_color is None and window.material_brightness.value() == 0
+    assert window.material_saturation.value() == 100 and window.light.value() == 0
+    assert window.material_scale.value() == 100 and window.material_angle.value() == 0
+    assert window.resolution.currentData() is None and window.repeat.currentText() == "1"
+    assert not window.preview_timer.isActive()
+    target = tmp_path / "回到原圖.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    expected = tmp_path / "預期原圖.jpg"
+    save_image(original, expected)
+    assert target.read_bytes() == expected.read_bytes()
+    assert path.read_bytes() == source_bytes
+
+
+def test_reset_uses_imported_original_even_after_confirmed_disk_overwrite(desktop, monkeypatch):
+    app, window, path, errors = desktop
+    original = window.original.copy()
+    window.light.setValue(0)
+    window.material_brightness.setValue(-50)
+    monkeypatch.setattr(window, "confirm_save", lambda path: QMessageBox.Yes)
+    window.save_current()
+    wait_render(app, window, errors)
+    changed_bytes = path.read_bytes()
+    assert not np.allclose(load_image(path), original)
+    window.reset_original()
+    np.testing.assert_array_equal(window.result, original)
+    assert path.read_bytes() == changed_bytes
+    window.process()
+    wait_render(app, window, errors)
+    np.testing.assert_array_equal(window.result, original)
+
+
+def test_random_mode_has_only_layout_controls_and_inherits_seamless_color(desktop):
+    app, window, path, errors = desktop
+    window.light.setValue(0)
+    window.material_saturation.setValue(0)
+    window.material_brightness.setValue(-50)
+    window.mode.setCurrentIndex(1)
+    wait_render(app, window, errors)
+    for control in (window.light, window.material_saturation, window.material_brightness, window.color_tools, window.reset_button):
+        assert not control.isVisible()
+    assert not hasattr(window, "variation")
+    for control in (window.material_scale, window.material_angle, window.shift_x, window.shift_y, window.direction):
+        assert control.isVisible()
+    np.testing.assert_allclose(window.result[..., 0], window.result[..., 1], atol=1e-6)
+    np.testing.assert_allclose(window.result[..., 1], window.result[..., 2], atol=1e-6)
+    assert window.result.shape == (384, 640, 3)
+    window.mode.setCurrentIndex(0)
+    assert window.light.isVisible() and window.color_tools.isVisible() and window.reset_button.isVisible()
+
+
+@pytest.mark.parametrize("style", ["Fusion", "Windows"])
+def test_visible_slider_handles_are_physically_aligned_at_their_defaults(desktop, style):
+    from PySide6.QtWidgets import QStyle, QStyleOptionSlider
+    app, window, path, errors = desktop
+    previous = app.style().objectName()
+    try:
+        app.setStyle(style)
+        app.processEvents()
+        centers = []
+        for control in (window.light, window.material_saturation, window.material_brightness, window.material_scale, window.material_angle):
+            option = QStyleOptionSlider()
+            control.slider.initStyleOption(option)
+            handle = control.slider.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderHandle, control.slider)
+            centers.append(control.slider.mapTo(window, handle.center()).x())
+        assert max(centers)-min(centers) <= 1
+        assert len({control.label.width() for control in (window.light, window.material_brightness, window.material_angle)}) == 1
+    finally:
+        app.setStyle(previous)
+
+
+@pytest.mark.parametrize("tool", ["clone", "dodge"])
+def test_brush_cursor_renders_only_a_white_circle_without_crosses(desktop, tool):
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QPainter
+    app, window, path, errors = desktop
+    getattr(window, "clone_button" if tool == "clone" else "dodge_button").setChecked(True)
+    wait_render(app, window, errors)
+    view = window.preview
+    assert view.cursor().shape() == Qt.BlankCursor
+    assert view.viewport().cursor().shape() == Qt.BlankCursor
+    window.clone_size.setValue(20)
+    window.pick_clone(QPointF(.5, .5))
+    view._brush_hover = QPointF(50, 30)
+    overlay = QImage(200, 200, QImage.Format_ARGB32)
+    overlay.fill(Qt.transparent)
+    painter = QPainter(overlay)
+    view.drawForeground(painter, QRectF(0, 0, 200, 200))
+    painter.end()
+    assert overlay.pixelColor(50, 30).alpha() == 0
+    assert overlay.pixelColor(80, 48).alpha() == 0
+    assert overlay.pixelColor(40, 30) == QColor("white")

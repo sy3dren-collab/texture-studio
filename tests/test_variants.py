@@ -40,11 +40,10 @@ def stagger_source():
                      .5+.2*np.sin(2*np.pi*(x+y)/128)), axis=-1).astype("float32")
 
 
-def test_zero_stagger_is_a_four_by_four_unit_at_fixed_resolution():
+def test_zero_stagger_preserves_every_source_pixel_in_four_by_four_output():
     source = stagger_source()
     result = stagger_tiles(source)
-    tile = cv2.resize(source, (32, 32), interpolation=cv2.INTER_AREA)
-    np.testing.assert_allclose(result, np.tile(tile, (4, 4, 1)), atol=1e-7)
+    np.testing.assert_allclose(result, np.tile(source, (4, 4, 1)), atol=1e-7)
 
 
 def test_random_offsets_are_independent_bounded_and_scale_without_rerolling():
@@ -68,13 +67,13 @@ def test_each_material_marker_moves_independently_in_rendered_pixels():
         count, labels, stats, centers = cv2.connectedComponentsWithStats((render[..., 0] > .7).astype("uint8"))
         assert count-1 == 16
         # Match each spot to its original grid position; jitter is < half a cell.
-        order = np.argsort((centers[1:, 1]//64)*4+centers[1:, 0]//64)
+        order = np.argsort((centers[1:, 1]//256)*4+centers[1:, 0]//256)
         return centers[1:][order]
     original, small, large = markers(base), markers(low), markers(high)
     small_delta, large_delta = small-original, large-original
     assert np.unique(np.round(large_delta, 1), axis=0).shape[0] >= 12
     np.testing.assert_allclose(large_delta, small_delta*3, atol=1.5)
-    assert np.abs(large_delta).max() <= 64*.3+1
+    assert np.abs(large_delta).max() <= 256*.3+1
     assert np.linalg.norm(large_delta) > 2*np.linalg.norm(small_delta)
 
 
@@ -92,7 +91,7 @@ def test_random_axis_does_not_shift_other_coordinate(axis):
 def test_combined_stagger_handles_rectangles_and_odd_sizes(shape):
     image = cv2.resize(stagger_source(), shape[::-1])
     result = stagger_tiles(image, .37, .28)
-    assert result.shape == image.shape
+    assert result.shape == (image.shape[0]*4, image.shape[1]*4, 3)
     assert result.dtype == np.float32
     assert np.isfinite(result).all()
     assert 0 <= result.min() <= result.max() <= 1
@@ -105,14 +104,15 @@ def test_random_repeat_has_continuous_edges_and_retains_detail():
     quality = seam_quality(result)
     assert max(quality["left_right"], quality["top_bottom"]) < .035
     assert result.std() > .15
-    assert not np.allclose(result[:256], result[256:])
-    assert not np.allclose(result[:, :256], result[:, 256:])
+    half_h, half_w = result.shape[0]//2, result.shape[1]//2
+    assert not np.allclose(result[:half_h], result[half_h:])
+    assert not np.allclose(result[:, :half_w], result[:, half_w:])
 
 
 def test_maximum_random_offsets_fill_all_pixels_without_dark_gaps():
     source = np.full((161, 257, 3), [.2, .5, .8], dtype="float32")
     result = stagger_tiles(source, 1, 1, 123)
-    np.testing.assert_allclose(result, source, atol=1e-6)
+    np.testing.assert_allclose(result, np.tile(source, (4, 4, 1)), atol=1e-6)
 
 
 def test_random_layout_can_be_cancelled_between_blocks():
@@ -126,3 +126,21 @@ def test_random_layout_can_be_cancelled_between_blocks():
 def test_stagger_rejects_invalid_offsets(x, y):
     with pytest.raises(ValueError, match="隨機位移"):
         stagger_tiles(stagger_source(), x, y)
+
+
+def test_native_random_layout_keeps_single_pixel_color_detail():
+    y, x = np.mgrid[:32, :48]
+    image = np.stack(((x % 2).astype("float32"), (y % 2).astype("float32"),
+                       ((x+y) % 2).astype("float32")), axis=-1)
+    result = stagger_tiles(image)
+    assert result.shape == (128, 192, 3)
+    np.testing.assert_allclose(result, np.tile(image, (4, 4, 1)), atol=1e-7)
+
+
+def test_only_interactive_preview_can_request_a_smaller_layout():
+    image = stagger_source()
+    full = stagger_tiles(image, .2, .3, 42)
+    preview = stagger_tiles(image, .2, .3, 42, output_size=(256, 256))
+    assert full.shape == (512, 512, 3)
+    assert preview.shape == (256, 256, 3)
+    assert image.shape == (128, 128, 3)

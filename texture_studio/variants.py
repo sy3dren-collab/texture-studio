@@ -11,24 +11,26 @@ def random_tile_offsets(shift_x, shift_y, seed):
     return (np.random.default_rng(seed).uniform(-1, 1, (4, 4, 2))*[shift_x, shift_y]).astype("float32")
 
 
-def stagger_tiles(image, shift_x=0, shift_y=0, seed=42, progress=lambda value: None):
+def stagger_tiles(image, shift_x=0, shift_y=0, seed=42, progress=lambda value: None, output_size=None):
     """Compose independently jittered material copies on a periodic domain.
 
-    The output contains a 4x4 material unit at every amplitude, so dragging
-    changes positions without changing scale. Each copy moves rigidly. Nearest
+    The output contains 4x4 full-resolution copies by default. A separate
+    output_size is used for interactive previews only. Each copy moves rigidly. Nearest
     patches fill gaps with wrapped source samples; narrow feathering softens
     overlaps. Toroidal distances preserve the same layout across all edges.
     """
     validate(image)
     offsets = random_tile_offsets(shift_x, shift_y, seed).reshape(-1, 2)
-    h, w = image.shape[:2]
-    tile_h, tile_w = max(1, (h+3)//4), max(1, (w+3)//4)
-    tile = cv2.resize(image, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+    tile_h, tile_w = image.shape[:2]
+    w, h = output_size if output_size is not None else (tile_w*4, tile_h*4)
+    if not isinstance(w, int) or not isinstance(h, int) or min(w, h) < 4 or w*h > 160_000_000:
+        raise ValueError("隨機排列尺寸過大，請降低單張素材大小；不會自動縮小像素")
+    tile = image
     rows, columns = np.mgrid[:4, :4]
     centers = (np.stack((columns, rows), axis=-1).reshape(-1, 2)+.5+offsets) % 4
     centers = centers.astype("float32")
     xs = (np.arange(w, dtype="float32")+.5)*(4/w)
-    result = np.empty_like(image)
+    result = np.empty((h, w, 3), dtype="float32")
     for start in range(0, h, 64):
         progress(90+int(6*start/h))
         end = min(h, start+64)
@@ -96,6 +98,9 @@ def generate_variants(image, count=4, seed=42, direction=True, mirror=False,
             result = result[::-1]
         if translate:
             result = np.roll(result, (rng.integers(result.shape[0]), rng.integers(result.shape[1])), axis=(0, 1))
+        if not any((brightness, hue, saturation, contrast)):
+            outputs.append(result.astype("float32", copy=True))
+            continue
         result = (result - .5) * (1 + rng.uniform(-contrast, contrast)) + .5 + rng.uniform(-brightness, brightness)
         hsv = cv2.cvtColor(np.clip(result, 0, 1).astype("float32"), cv2.COLOR_RGB2HSV)
         hsv[..., 0] = (hsv[..., 0] + rng.uniform(-hue, hue) * 360) % 360

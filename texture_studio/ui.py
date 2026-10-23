@@ -32,6 +32,7 @@ class Window(QMainWindow):
         self.original = self.result = None
         self.original_path = None
         self._working_sources = {}
+        self._imported_sources = {}
         self._staged_sources = set()
         self._capture_paths = set()
         self.outputs = []
@@ -164,7 +165,7 @@ class Window(QMainWindow):
         self.material_brightness = PercentControl(0, -100, 100, resettable=True)
         self.material_brightness.setToolTip("0% 保留原明暗；向右變亮，向左變暗")
         right.addRow("明暗度", self.material_brightness)
-        color_tools = QWidget()
+        self.color_tools = color_tools = QWidget()
         color_layout = QHBoxLayout(color_tools)
         color_layout.setContentsMargins(0, 0, 0, 0)
         self.color_button = QPushButton("上色…")
@@ -180,8 +181,6 @@ class Window(QMainWindow):
         self.material_angle = PercentControl(0, -180, 180, "°", resettable=True)
         self.material_angle.setToolTip("以單張素材中心旋轉紋路，不旋轉整面木地板排列")
         right.addRow("旋轉角度", self.material_angle)
-        self.variation = PercentControl(20, resettable=True)
-        right.addRow("變化程度", self.variation)
         self.shift_x = PercentControl(20, resettable=True)
         self.shift_y = PercentControl(20, resettable=True)
         self.shift_x.setToolTip("每張素材各自隨機左右位移；數值是最大幅度，100% 為一張素材寬，0% 不位移；右鍵恢復 20%")
@@ -214,6 +213,10 @@ class Window(QMainWindow):
         self.primary_button = QPushButton("一鍵製圖")
         self.primary_button.clicked.connect(self.primary_action)
         right.addRow(self.primary_button)
+        self.reset_button = QPushButton("回到原圖")
+        self.reset_button.setToolTip("清除本次素材的修改，回到匯入時的原圖；不改寫磁碟上的檔案")
+        self.reset_button.clicked.connect(self.reset_original)
+        right.addRow(self.reset_button)
         for text, function in [("取消", self.cancel),
                 ("回到上次結果", self.undo)]:
             button = QPushButton(text)
@@ -225,7 +228,7 @@ class Window(QMainWindow):
         self.board_width.valueChanged.connect(self.update_board_limits)
         self.board_length.valueChanged.connect(self.update_board_limits)
         for control in (self.light, self.material_saturation, self.material_brightness,
-                        self.material_scale, self.material_angle, self.variation, self.shift_x, self.shift_y):
+                        self.material_scale, self.material_angle, self.shift_x, self.shift_y):
             control.valueChanged.connect(self.request_preview)
         for control in (self.board_width, self.board_length, self.gap):
             control.valueChanged.connect(self.request_preview)
@@ -233,7 +236,7 @@ class Window(QMainWindow):
             control.currentIndexChanged.connect(self.request_preview)
         self.direction.toggled.connect(self.request_preview)
         self.edit_controls = (self.mode, self.light, self.material_saturation, self.material_brightness,
-                              self.material_scale, self.material_angle, self.variation, self.shift_x, self.shift_y,
+                              self.material_scale, self.material_angle, self.shift_x, self.shift_y,
                               self.color_button, self.clear_color_button, self.direction, self.pattern,
                               self.board_width, self.board_length, self.gap, self.resolution, self.shuffle_button,
                               self.primary_button)
@@ -321,14 +324,67 @@ class Window(QMainWindow):
             return
         self._last_mode = mode
         self.primary_button.setText("儲存變更" if mode == 1 else "一鍵製圖")
-        for widget in (self.variation, self.direction, self.shift_x, self.shift_y):
+        self.quick_form.setRowVisible(self.reset_button, mode == 0)
+        for widget in (self.light, self.material_saturation, self.material_brightness, self.color_tools):
+            self.quick_form.setRowVisible(widget, mode != 1)
+        for widget in (self.direction, self.shift_x, self.shift_y):
             self.quick_form.setRowVisible(widget, mode == 1)
         for widget in (self.pattern, self.board_width, self.board_length, self.gap):
             self.quick_form.setRowVisible(widget, mode == 2)
         self.quick_form.setRowVisible(self.shuffle_button, mode != 0)
         self.shuffle_button.setText("換一組變體" if mode == 1 else "換一組排列")
-        self.size_hint.setText("單張整面自動為 1K；存檔依預覽數量鋪排" if mode == 2 else "單張保留原始比例；存檔依預覽數量鋪排")
+        self.size_hint.setText("單張整面自動為 1K；存檔依預覽數量鋪排" if mode == 2 else
+                               "每份素材保留像素；4×4 隨機排列會擴大整張尺寸" if mode == 1 else
+                               "單張保留原始比例；存檔依預覽數量鋪排")
         self.request_preview()
+
+    def reset_original(self):
+        path = self.current_path()
+        if self.thread is not None or self._applying_variant:
+            return
+        if path not in self._imported_sources:
+            self.error("請先匯入圖片")
+            return
+        self.preview_timer.stop()
+        self._pending_preview = False
+        self._pending_export = None
+        self.clone_button.setChecked(False)
+        self.dodge_button.setChecked(False)
+        self._restoring = True
+        try:
+            self._generation += 1
+            image = self._imported_sources[path]
+            self._working_sources[path] = image
+            self._staged_sources.add(path)
+            self._source_cache.clear()
+            self.regions.pop(path, None)
+            self._clone_stroke = self._clone_undo = None
+            self._clone_source = self._clone_offset = None
+            self.mode.setCurrentIndex(0)
+            self.crop_button.setChecked(False)
+            self.fill_button.setChecked(False)
+            self.repeat.setCurrentText("1")
+            self.light.setValue(0)
+            self.material_saturation.setValue(100)
+            self.material_brightness.setValue(0)
+            self.material_scale.setValue(100)
+            self.material_angle.setValue(0)
+            self.clear_color()
+            self.shift_x.setValue(20)
+            self.shift_y.setValue(20)
+            self.direction.setChecked(True)
+            self.board_width.setValue(150)
+            self.board_length.setValue(900)
+            self.gap.setValue(2)
+            self.pattern.setCurrentIndex(self.pattern.findData("half"))
+            self.resolution.setCurrentIndex(0)
+            self.seed_value = 42
+            self.loaded(image, path)
+            self.outputs = [("base_color", image)]
+            self.processed_settings = self.snapshot()
+            self.metrics.setText("已回到匯入時的原圖，所有素材修改已清除")
+        finally:
+            self._restoring = False
 
     def open_bump(self):
         if self.original is None or self.original_path != self.current_path():
@@ -393,7 +449,6 @@ class Window(QMainWindow):
                 return
             self.finish_clone()
             self.preview.set_clone_mode(False)
-            self.preview.clone_reference = None
             self._clone_source = self._clone_offset = self._clone_undo = None
             self.clone_tools.hide()
             self.clone_pick_button.setChecked(False)
@@ -404,7 +459,6 @@ class Window(QMainWindow):
 
     def activate_clone(self, kind="clone"):
         self._clone_source = self._clone_offset = self._clone_undo = None
-        self.preview.clone_reference = None
         self.preview.brush_kind = kind
         self.preview.set_clone_mode(True)
         self.clone_tools.show()
@@ -428,7 +482,6 @@ class Window(QMainWindow):
     def pick_clone(self, point):
         self._clone_source = QPointF(point)
         self._clone_offset = None
-        self.preview.clone_reference = QPointF(point)
         self.clone_pick_button.setChecked(False)
         self.metrics.setText("已選取參考點，可拖曳塗抹；Alt＋點擊重新取樣")
         self.preview.viewport().update()
@@ -458,8 +511,6 @@ class Window(QMainWindow):
         h, w = self._clone_stroke.image.shape[:2]
         self._clone_stroke.paint_to((point.x()*w-.5, point.y()*h-.5))
         self.result = self._clone_stroke.image
-        if self._clone_offset is not None:
-            self.preview.clone_reference = point+self._clone_offset
         self.show_clone_result()
 
     def show_clone_result(self):
@@ -630,6 +681,7 @@ class Window(QMainWindow):
             path = self.paths.pop(index)
             self.regions.pop(path, None)
             self._working_sources.pop(path, None)
+            self._imported_sources.pop(path, None)
             self._staged_sources.discard(path)
             self._capture_paths.discard(path)
             self.weights.pop(index)
@@ -649,6 +701,7 @@ class Window(QMainWindow):
                 self._source_cache.clear()
                 self.original_path = None
                 self._working_sources.clear()
+                self._imported_sources.clear()
                 self._staged_sources.clear()
                 self.preview.clear_image()
                 self.info.setText("先匯入圖片，再按一鍵製圖")
@@ -667,6 +720,7 @@ class Window(QMainWindow):
     def loaded(self, image, path=None):
         self.original = image
         self.original_path = path or self.current_path()
+        self._imported_sources.setdefault(self.original_path, image)
         self.result = image
         self.outputs = []
         self.previous_outputs = []
@@ -694,16 +748,16 @@ class Window(QMainWindow):
         edge = self.resolution.currentData()
         factor = (edge or (1024 if mode == 2 else max(source_h, source_w)))/max(source_h, source_w)
         output_w, output_h = max(4, round(source_w*factor)), max(4, round(source_h*factor))
-        amount = self.variation.value()/100
+        if mode == 1:
+            output_w, output_h = output_w*4, output_h*4
         data = {"mode": mode, "light": self.light.value()/100, "seed": self.seed_value,
                 "board_width": width, "board_length": length, "gap": self.gap.value(),
                 "world_width": length*4, "world_height": width*12,
                 "min_length": length*.5, "max_length": length*4/3,
-                "brightness": amount*.15, "hue": amount*.05, "saturation": amount*.25,
-                "random_contrast": amount*.25, "direction": self.direction.isChecked(),
+                "brightness": .03, "direction": self.direction.isChecked(),
                 "pattern": self.pattern.currentData(),
                 "width": output_w, "height": output_h,
-                "output_size": edge, "variation": self.variation.value(),
+                "output_size": edge,
                 "shift_x": self.shift_x.value()/100, "shift_y": self.shift_y.value()/100,
                 "material_saturation": self.material_saturation.value()/100,
                 "material_brightness": self.material_brightness.value()/100,
@@ -772,10 +826,15 @@ class Window(QMainWindow):
 
         def operation(progress):
             import cv2
+            if not preview:
+                repeats = snapshot["repeat_count"] if export_request and not (export_request.get("apply_variant") or export_request.get("bump")) else 1
+                if settings["width"]*settings["height"]*repeats*repeats > 160_000_000:
+                    raise ValueError("鋪排後超過 1.6 億像素，請降低預覽數量或單張素材大小；不會自動縮小像素")
             if settings["mode"] != 2:
                 image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"], snapshot["source_baselines"], snapshot["staged_paths"])
                 progress(25)
-                size = (settings["width"], settings["height"])
+                divisor = 4 if settings["mode"] == 1 else 1
+                size = (max(4, settings["width"]//divisor), max(4, settings["height"]//divisor))
                 if (image.shape[1], image.shape[0]) != size:
                     image = cv2.resize(image, size, interpolation=cv2.INTER_AREA if preview else cv2.INTER_CUBIC)
                 image = appearance(image)
@@ -786,10 +845,10 @@ class Window(QMainWindow):
                     from .variants import generate_variants, stagger_tiles
                     variants = generate_variants(
                         image, count=1, seed=settings["seed"], direction=settings["direction"],
-                        mirror=False, progress=progress, brightness=settings["brightness"], hue=settings["hue"],
-                        saturation=settings["saturation"], contrast=settings["random_contrast"], translate=True)
+                        mirror=False, progress=progress, brightness=0, hue=0,
+                        saturation=0, contrast=0, translate=False)
                     outputs = [(f"variant_{i:02d}", stagger_tiles(result, settings["shift_x"], settings["shift_y"],
-                                                               settings["seed"], progress))
+                                                               settings["seed"], progress, output_size=(settings["width"], settings["height"])))
                                for i, result in enumerate(variants)]
             else:
                 from .boards import BoardSettings, generate_boards
@@ -871,6 +930,7 @@ class Window(QMainWindow):
         self.clone_button.setEnabled(False)
         self.dodge_button.setEnabled(False)
         self.clone_tools.setEnabled(False)
+        self.reset_button.setEnabled(False)
         self.preview.clone_suspended = True
         thread.start()
 
@@ -901,6 +961,7 @@ class Window(QMainWindow):
         self.full_image_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
         self.capture_button.setEnabled(not self._applying_variant)
         self.save_button.setEnabled(not self._applying_variant)
+        self.reset_button.setEnabled(not self._applying_variant)
         if self._pending_export is not None:
             request, self._pending_export = self._pending_export, None
             self.process(export_request=request)
@@ -951,7 +1012,7 @@ class Window(QMainWindow):
             color = QColor.fromRgbF(*self.tint_color) if self.tint_color else None
             self.color_button.setText(color.name() if color else "上色…")
             self.color_button.setStyleSheet(f"border: 2px solid {color.name()};" if color else "")
-            for name in ("board_width", "board_length", "gap", "variation"):
+            for name in ("board_width", "board_length", "gap"):
                 getattr(self, name).setValue(settings[name])
             self.direction.setChecked(settings["direction"])
             self.pattern.setCurrentIndex(self.pattern.findData(settings["pattern"]))
