@@ -89,7 +89,14 @@ def run(output):
     app.processEvents()
     window.close()
     app.processEvents()
-    report = {"version": __version__, "frozen": bool(getattr(sys, "frozen", False)),
+    runtime = sys.platform
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.ntdll.wine_get_version
+            runtime = "wine"
+        except AttributeError:
+            runtime = "native_windows"
+    report = {"version": __version__, "frozen": bool(getattr(sys, "frozen", False)), "runtime": runtime,
               "platform": sys.platform, "qt_platform": app.platformName(),
               "console_window": ctypes.windll.kernel32.GetConsoleWindow() if sys.platform == "win32" else None,
               "checks": ["gui", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"],

@@ -1,5 +1,6 @@
 """Run the real windowless Windows entry when a Windows runner is available."""
 import json
+import ctypes
 import os
 from pathlib import Path
 import shutil
@@ -9,7 +10,17 @@ import time
 import pytest
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows Script Host and pythonw.exe")
+def native_windows_script_host():
+    if sys.platform != "win32":
+        return False
+    try:
+        ctypes.windll.ntdll.wine_get_version
+        return False
+    except AttributeError:
+        return True
+
+
+@pytest.mark.skipif(not native_windows_script_host(), reason="Requires native Windows Script Host; not supported by Wine")
 def test_windowless_entry_handles_unicode_paths_and_creates_no_console(tmp_path):
     root = tmp_path / "素材工作室 with spaces"
     root.mkdir()

@@ -1,5 +1,6 @@
 """Build and validate one portable Windows GUI executable."""
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -22,7 +23,15 @@ def main():
         raise SystemExit("Build on 64-bit Windows with Python 3.12; this script does not cross-compile.")
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--allow-wine", action="store_true", help="Build under Wine and explicitly label compatibility-layer validation")
     args = parser.parse_args()
+    try:
+        ctypes.windll.ntdll.wine_get_version
+        wine = True
+    except AttributeError:
+        wine = False
+    if wine and not args.allow_wine:
+        raise SystemExit("Wine requires --allow-wine; results must not be described as native Windows verification.")
     root = Path(__file__).resolve().parents[1]
     os.chdir(root)
     output = Path(args.output).resolve()
@@ -53,7 +62,7 @@ def main():
     StringStruct('OriginalFilename', 'TextureStudio.exe')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])])
 """, encoding="utf-8")
-    command("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+    command("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--noupx",
             "--name", "TextureStudio", "--collect-submodules", "texture_studio", "--exclude-module", "pytest",
             "--version-file", str(metadata), "--distpath", str(output / "dist"),
             "--workpath", str(output / "build"), "--specpath", str(output), str(root / "launch.py"))
@@ -71,7 +80,7 @@ def main():
             raise RuntimeError("Executable is not a windowed GUI application")
     # Launch ONLY the EXE from a different directory with source/Python paths
     # removed. This proves it can load bundled Qt, OpenCV, NumPy and Pillow.
-    with tempfile.TemporaryDirectory(prefix="Texture Studio 獨立測試 ") as isolated:
+    with tempfile.TemporaryDirectory(prefix="Texture Studio 獨立測試 ", ignore_cleanup_errors=True) as isolated:
         isolated = Path(isolated)
         portable = isolated / executable.name
         shutil.copy2(executable, portable)
@@ -80,10 +89,15 @@ def main():
         system_root = os.environ["SystemRoot"]
         smoke_env["PATH"] = str(Path(system_root) / "System32")+os.pathsep+system_root
         smoke_env["QT_QPA_PLATFORM"] = "windows"
-        result = subprocess.run([str(portable), "--smoke-test", str(smoke_output)], cwd=isolated,
-                                env=smoke_env, timeout=120)
-        if result.returncode != 0:
-            raise RuntimeError(f"Standalone EXE failed with exit code {result.returncode}")
+        process = subprocess.Popen([str(portable), "--smoke-test", str(smoke_output)], cwd=isolated, env=smoke_env)
+        try:
+            code = process.wait(timeout=120)
+        except subprocess.TimeoutExpired as error:
+            # Kill only the build's own onefile parent/child processes.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
+            raise RuntimeError("Standalone EXE did not finish its checks within 120 seconds") from error
+        if code != 0:
+            raise RuntimeError(f"Standalone EXE failed with exit code {code}")
         report = json.loads((smoke_output / "smoke.json").read_text(encoding="utf-8"))
         if not report["frozen"] or report["platform"] != "win32" or report["console_window"] != 0 or report["qt_platform"] != "windows":
             raise RuntimeError("Standalone GUI validation failed")
@@ -91,7 +105,8 @@ def main():
     release.mkdir(exist_ok=True)
     shutil.copy2(executable, release / executable.name)
     checksum = hashlib.sha256(executable.read_bytes()).hexdigest()
-    report.update(test_suite=test_results, architecture="x64", subsystem="GUI", sha256=checksum)
+    report.update(test_suite=test_results, architecture="x64", subsystem="GUI", sha256=checksum,
+                  native_windows_verified=not wine)
     (release / "TextureStudio.exe.sha256").write_text(f"{checksum}  TextureStudio.exe\n", encoding="ascii")
     (release / "windows-validation.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     with zipfile.ZipFile(release / "TextureStudio-Windows-x64.zip", "w", zipfile.ZIP_DEFLATED) as archive:

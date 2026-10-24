@@ -14,7 +14,7 @@ def test_real_file_workflow(tmp_path, mode):
     config.write_text(json.dumps({"width":128,"height":64}), encoding="utf-8")
     target = tmp_path / mode
     main([mode, str(path), "--output", str(target), "--config", str(config), "--maps"])
-    metadata = json.loads((target/"project.json").read_text())
+    metadata = json.loads((target/"project.json").read_text(encoding="utf-8"))
     assert metadata["seed"] == 42
     assert metadata["outputs"]
     for name in metadata["outputs"]:

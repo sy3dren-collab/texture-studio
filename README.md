@@ -6,9 +6,11 @@
 
 ## Windows 10／11
 
-獨立版由 GitHub 的 Windows 建置流程產生：執行完整測試後，以 PyInstaller 打包成單一 `TextureStudio.exe`，再從隔離資料夾、移除外部 Python 路徑的情況下實際啟動，確認 GUI、原尺寸排列、筆刷、JPEG、BUMP 與法線輸出。通過後才將 EXE、ZIP、SHA-256 與 Windows 驗證報告附加至對應版本的 GitHub Release。
+[下載 Windows x64 獨立 EXE 包](https://github.com/sy3dren-collab/texture-studio/archive/refs/tags/windows-v0.6.2.zip)。完整解壓縮後雙擊 `TextureStudio.exe`，不需安裝 Python，不開啟終端機。
 
-獨立版完整解壓縮後雙擊 `TextureStudio.exe`，不需安裝 Python，不開啟終端機。原始碼 ZIP 使用下列方式：
+此版本使用 Windows CPython 3.12.7 在 Wine 相容層打包，151 項測試通過，原生 Windows Script Host 測試略過；單檔 EXE 另通過隔離啟動、GUI、原尺寸排列、筆刷、JPEG、BUMP 與法線輸出檢查。已確認 x64／GUI 子系統、無 console 視窗及內含 Python；**尚未完成原生 Windows 實機驗證**，詳細結果見包內 `windows-validation.json`。
+
+GitHub 原生 Windows 建置流程亦已準備，測試與隔離啟動通過才發布 GitHub Release 附件；本次未取得該遠端執行證據。Wine 建置背景見 [packaging/WINE.md](packaging/WINE.md)。原始碼 ZIP 使用下列方式：
 
 先將 ZIP **完整解壓縮**到一般資料夾，不可在壓縮檔檢視器內直接執行。首次使用需安裝 64-bit Python 3.12（3.11–3.13 也支援，包含 Python Launcher），執行一次：
 

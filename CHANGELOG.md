@@ -1,5 +1,15 @@
 # 開發與驗證紀錄
 
+## v0.6.2 — 可下載的 Windows x64 單檔 EXE
+
+以 Windows CPython 3.12.7／PyInstaller 6.14.1 於 Wine 相容環境產生真正的 x64 PE GUI 單檔程式，內含 Python、Qt、OpenCV、NumPy、Pillow。移除 UPX 壓縮，解決首次隔離啟動失敗，保留原始 DLL；建置逾時只結束自己的父子程序，不再由暫存清理錯誤掩蓋主要失敗原因。
+
+Wine 建置環境使用固定 Docker digest、官方 Microsoft SDK 的 Universal CRT 與 UTF-8 locale。修正 CLI 測試讀取 UTF-8 JSON 時依賴系統預設編碼的問題；原生 Windows Script Host 測試明確排除不支援的 Wine，保留真正 Windows 的測試。
+
+Windows Python／Wine 環境 151 項測試通過、1 項原生 Script Host 測試略過。成品另確認 PE x64、GUI 子系統，從中文含空格的隔離資料夾、移除 Python 搜尋路徑後啟動；實際操作逐輪疊加、原尺寸隨機排列、筆刷、JPEG、BUMP 黑白反轉及法線輸出，重新解碼核對三張圖的 576×128 像素及格式，檢查 console handle 為 0。報告明確標示 `runtime: wine`、`native_windows_verified: false`，不宣稱原生 Windows 實機驗收完成。
+
+獨立包以 `windows-v0.6.2` 標籤發布，內含 `TextureStudio.exe`、SHA-256 與驗證報告，與原始碼標籤分開。EXE SHA-256：`d7c2e9704777f41bc37d253c50b32b120c0bb9d19aa71830aa32603799dcbab1`。
+
 ## v0.6.1 — Windows 單檔獨立 EXE 建置與驗證
 
 新增 GitHub Windows 2022／Python 3.12 x64 建置流程，所有外部 Actions 固定至已確認的 commit。標籤推送後先執行完整測試，再以 PyInstaller `--onefile --windowed` 打包單一 `TextureStudio.exe`，附正式檔案版本資訊。
