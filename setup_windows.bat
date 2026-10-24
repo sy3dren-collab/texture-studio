@@ -34,7 +34,7 @@ set "TS_EXIT=%errorlevel%"
 type "logs\setup.log"
 if not "%TS_EXIT%"=="0" goto failed
 echo.
-echo Setup completed. Run start_windows.bat to open the app.
+echo Setup completed. Double-click TextureStudio.vbs to open the app without a console.
 pause
 exit /b 0
 

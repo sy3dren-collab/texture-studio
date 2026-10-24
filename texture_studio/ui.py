@@ -13,6 +13,7 @@ from .capture import ScreenCapture
 from .storage import file_signature, replace_source
 from .painting import PeriodicCloneStroke, PeriodicDodgeStroke
 from .widgets import Preview, PercentControl, Worker
+from .variants import rotation_angle
 from . import __version__
 
 
@@ -187,7 +188,10 @@ class Window(QMainWindow):
         self.shift_y.setToolTip("每張素材各自隨機上下位移；數值是最大幅度，100% 為一張素材高，0% 不位移；右鍵恢復 20%")
         right.addRow("X 軸隨機位移", self.shift_x)
         right.addRow("Y 軸隨機位移", self.shift_y)
+        self.grid_columns = self.number(right, "橫向張數", 2, 1, 8, True)
+        self.grid_rows = self.number(right, "縱向張數", 2, 1, 8, True)
         self.direction = QCheckBox("保留木紋方向")
+        self.direction.setToolTip("勾選僅允許 0°／180°，避免木紋轉橫；取消後也允許 90°／270°，不會縮小素材像素")
         self.direction.setChecked(True)
         right.addRow(self.direction)
         self.pattern = QComboBox()
@@ -230,16 +234,18 @@ class Window(QMainWindow):
         for control in (self.light, self.material_saturation, self.material_brightness,
                         self.material_scale, self.material_angle, self.shift_x, self.shift_y):
             control.valueChanged.connect(self.request_preview)
-        for control in (self.board_width, self.board_length, self.gap):
+        for control in (self.board_width, self.board_length, self.gap, self.grid_columns, self.grid_rows):
             control.valueChanged.connect(self.request_preview)
         for control in (self.pattern, self.resolution):
             control.currentIndexChanged.connect(self.request_preview)
         self.direction.toggled.connect(self.request_preview)
+        self.grid_columns.valueChanged.connect(self.update_grid_hint)
+        self.grid_rows.valueChanged.connect(self.update_grid_hint)
         self.edit_controls = (self.mode, self.light, self.material_saturation, self.material_brightness,
                               self.material_scale, self.material_angle, self.shift_x, self.shift_y,
                               self.color_button, self.clear_color_button, self.direction, self.pattern,
                               self.board_width, self.board_length, self.gap, self.resolution, self.shuffle_button,
-                              self.primary_button)
+                              self.primary_button, self.grid_columns, self.grid_rows)
         self.update_mode()
 
     def choose_color(self):
@@ -322,21 +328,28 @@ class Window(QMainWindow):
             self.mode.blockSignals(False)
             self.open_bump()
             return
+        if mode == 1 and self._last_mode != 1 and not self._restoring:
+            self.repeat.setCurrentText("1")
         self._last_mode = mode
         self.primary_button.setText("儲存變更" if mode == 1 else "一鍵製圖")
         self.quick_form.setRowVisible(self.reset_button, mode == 0)
         for widget in (self.light, self.material_saturation, self.material_brightness, self.color_tools):
             self.quick_form.setRowVisible(widget, mode != 1)
-        for widget in (self.direction, self.shift_x, self.shift_y):
+        for widget in (self.direction, self.shift_x, self.shift_y, self.grid_columns, self.grid_rows):
             self.quick_form.setRowVisible(widget, mode == 1)
         for widget in (self.pattern, self.board_width, self.board_length, self.gap):
             self.quick_form.setRowVisible(widget, mode == 2)
         self.quick_form.setRowVisible(self.shuffle_button, mode != 0)
         self.shuffle_button.setText("換一組變體" if mode == 1 else "換一組排列")
         self.size_hint.setText("單張整面自動為 1K；存檔依預覽數量鋪排" if mode == 2 else
-                               "每份素材保留像素；4×4 隨機排列會擴大整張尺寸" if mode == 1 else
                                "單張保留原始比例；存檔依預覽數量鋪排")
+        self.update_grid_hint()
         self.request_preview()
+
+    def update_grid_hint(self, *_):
+        if self.mode.currentIndex() == 1:
+            columns, rows = self.grid_columns.value(), self.grid_rows.value()
+            self.size_hint.setText(f"{columns}×{rows} 共 {columns*rows} 份；保留每份像素，預覽會配合視窗縮放")
 
     def reset_original(self):
         path = self.current_path()
@@ -372,6 +385,8 @@ class Window(QMainWindow):
             self.clear_color()
             self.shift_x.setValue(20)
             self.shift_y.setValue(20)
+            self.grid_columns.setValue(2)
+            self.grid_rows.setValue(2)
             self.direction.setChecked(True)
             self.board_width.setValue(150)
             self.board_length.setValue(900)
@@ -407,7 +422,7 @@ class Window(QMainWindow):
         dialog.show()
 
     def primary_action(self):
-        if self.mode.currentIndex() != 1:
+        if self.mode.currentIndex() == 2:
             self.process()
             return
         self.prepare_material()
@@ -573,7 +588,7 @@ class Window(QMainWindow):
             self.loaded(image, path)
             self.outputs = [("base_color", image)]
             self.processed_settings = self.snapshot()
-            self.metrics.setText("已儲存變更，可繼續修改無縫貼圖；寫入圖片請按「儲存檔案」")
+            self.metrics.setText("本輪結果已暫存，可繼續疊加修改；寫入圖片請按「儲存檔案」")
         finally:
             self._restoring = False
 
@@ -748,8 +763,12 @@ class Window(QMainWindow):
         edge = self.resolution.currentData()
         factor = (edge or (1024 if mode == 2 else max(source_h, source_w)))/max(source_h, source_w)
         output_w, output_h = max(4, round(source_w*factor)), max(4, round(source_h*factor))
+        material_w, material_h = output_w, output_h
         if mode == 1:
-            output_w, output_h = output_w*4, output_h*4
+            if rotation_angle(np.random.default_rng(self.seed_value), self.direction.isChecked()) % 180:
+                output_w, output_h = output_h, output_w
+            output_w *= self.grid_columns.value()
+            output_h *= self.grid_rows.value()
         data = {"mode": mode, "light": self.light.value()/100, "seed": self.seed_value,
                 "board_width": width, "board_length": length, "gap": self.gap.value(),
                 "world_width": length*4, "world_height": width*12,
@@ -758,6 +777,8 @@ class Window(QMainWindow):
                 "pattern": self.pattern.currentData(),
                 "width": output_w, "height": output_h,
                 "output_size": edge,
+                "material_width": material_w, "material_height": material_h,
+                "grid_columns": self.grid_columns.value(), "grid_rows": self.grid_rows.value(),
                 "shift_x": self.shift_x.value()/100, "shift_y": self.shift_y.value()/100,
                 "material_saturation": self.material_saturation.value()/100,
                 "material_brightness": self.material_brightness.value()/100,
@@ -818,6 +839,8 @@ class Window(QMainWindow):
             ratio = min(1, 1024/max(settings["width"], settings["height"]))
             settings["width"] = max(4, round(settings["width"]*ratio))
             settings["height"] = max(4, round(settings["height"]*ratio))
+            settings["material_width"] = max(4, round(settings["material_width"]*ratio))
+            settings["material_height"] = max(4, round(settings["material_height"]*ratio))
         self.crop_button.setChecked(False)
 
         def appearance(image):
@@ -833,8 +856,7 @@ class Window(QMainWindow):
             if settings["mode"] != 2:
                 image = self.prepared_source(paths[index], regions.get(paths[index]), settings["light"], snapshot["source_baselines"], snapshot["staged_paths"])
                 progress(25)
-                divisor = 4 if settings["mode"] == 1 else 1
-                size = (max(4, settings["width"]//divisor), max(4, settings["height"]//divisor))
+                size = (settings["material_width"], settings["material_height"])
                 if (image.shape[1], image.shape[0]) != size:
                     image = cv2.resize(image, size, interpolation=cv2.INTER_AREA if preview else cv2.INTER_CUBIC)
                 image = appearance(image)
@@ -848,7 +870,8 @@ class Window(QMainWindow):
                         mirror=False, progress=progress, brightness=0, hue=0,
                         saturation=0, contrast=0, translate=False)
                     outputs = [(f"variant_{i:02d}", stagger_tiles(result, settings["shift_x"], settings["shift_y"],
-                                                               settings["seed"], progress, output_size=(settings["width"], settings["height"])))
+                                                               settings["seed"], progress, output_size=(settings["width"], settings["height"]),
+                                                               columns=settings["grid_columns"], rows=settings["grid_rows"]))
                                for i, result in enumerate(variants)]
             else:
                 from .boards import BoardSettings, generate_boards
@@ -896,7 +919,11 @@ class Window(QMainWindow):
                 self._previous_snapshot = previous
                 self.processed_settings = snapshot
                 if preview:
-                    self.metrics.setText("調整預覽 · 儲存時會使用所選的完整解析度")
+                    if settings["mode"] == 1:
+                        full = snapshot["settings"]
+                        self.metrics.setText(f"縮放預覽 · 共 {full['grid_columns']*full['grid_rows']} 份 · 完整排列 {full['width']} × {full['height']} px")
+                    else:
+                        self.metrics.setText("調整預覽 · 儲存時會使用所選的完整解析度")
             else:
                 self._pending_preview = True
             if export_request:
@@ -1015,6 +1042,8 @@ class Window(QMainWindow):
             for name in ("board_width", "board_length", "gap"):
                 getattr(self, name).setValue(settings[name])
             self.direction.setChecked(settings["direction"])
+            self.grid_columns.setValue(settings["grid_columns"])
+            self.grid_rows.setValue(settings["grid_rows"])
             self.pattern.setCurrentIndex(self.pattern.findData(settings["pattern"]))
             self.resolution.setCurrentIndex(self.resolution.findData(settings["output_size"]))
             self.seed_value = settings["seed"]

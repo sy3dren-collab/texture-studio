@@ -4,65 +4,71 @@ import numpy as np
 from .core import seamless, validate
 
 
-def random_tile_offsets(shift_x, shift_y, seed):
-    """Independent offsets in material widths/heights for a 4x4 repeat."""
+def random_tile_offsets(shift_x, shift_y, seed, columns=2, rows=2):
+    """Independent offsets in material widths/heights for a configurable repeat."""
     if not np.isfinite([shift_x, shift_y]).all() or not (0 <= shift_x <= 1 and 0 <= shift_y <= 1):
         raise ValueError("隨機位移幅度必須介於 0% 與 100%")
-    return (np.random.default_rng(seed).uniform(-1, 1, (4, 4, 2))*[shift_x, shift_y]).astype("float32")
+    if any(not isinstance(value, int) or not 1 <= value <= 8 for value in (columns, rows)):
+        raise ValueError("橫向與縱向素材張數須介於 1 與 8")
+    return (np.random.default_rng(seed).uniform(-1, 1, (rows, columns, 2))*[shift_x, shift_y]).astype("float32")
 
 
-def stagger_tiles(image, shift_x=0, shift_y=0, seed=42, progress=lambda value: None, output_size=None):
+def stagger_tiles(image, shift_x=0, shift_y=0, seed=42, progress=lambda value: None, output_size=None, columns=2, rows=2):
     """Compose independently jittered material copies on a periodic domain.
 
-    The output contains 4x4 full-resolution copies by default. A separate
+    The output contains 2x2 full-resolution copies by default. A separate
     output_size is used for interactive previews only. Each copy moves rigidly. Nearest
     patches fill gaps with wrapped source samples; narrow feathering softens
     overlaps. Toroidal distances preserve the same layout across all edges.
     """
     validate(image)
-    offsets = random_tile_offsets(shift_x, shift_y, seed).reshape(-1, 2)
+    offsets = random_tile_offsets(shift_x, shift_y, seed, columns, rows).reshape(-1, 2)
     tile_h, tile_w = image.shape[:2]
-    w, h = output_size if output_size is not None else (tile_w*4, tile_h*4)
+    # Keep native detail crisp: random moves land on whole source pixels.
+    offsets = np.rint(offsets*[tile_w, tile_h])/[tile_w, tile_h]
+    w, h = output_size if output_size is not None else (tile_w*columns, tile_h*rows)
     if not isinstance(w, int) or not isinstance(h, int) or min(w, h) < 4 or w*h > 160_000_000:
         raise ValueError("隨機排列尺寸過大，請降低單張素材大小；不會自動縮小像素")
     tile = image
-    rows, columns = np.mgrid[:4, :4]
-    centers = (np.stack((columns, rows), axis=-1).reshape(-1, 2)+.5+offsets) % 4
+    grid_y, grid_x = np.mgrid[:rows, :columns]
+    centers = (np.stack((grid_x, grid_y), axis=-1).reshape(-1, 2)+.5+offsets) % [columns, rows]
     centers = centers.astype("float32")
-    xs = (np.arange(w, dtype="float32")+.5)*(4/w)
+    all_xs = (np.arange(w, dtype="float32")+.5)*(columns/w)
     result = np.empty((h, w, 3), dtype="float32")
     for start in range(0, h, 64):
         progress(90+int(6*start/h))
         end = min(h, start+64)
-        ys = (np.arange(start, end, dtype="float32")+.5)*(4/h)
-        shape = (end-start, w)
-        best = np.full(shape, np.inf, dtype="float32")
-        second = best.copy()
-        first_index = np.zeros(shape, dtype="uint8")
-        second_index = first_index.copy()
-        for index, (cx, cy) in enumerate(centers):
-            dx = (xs-cx+2) % 4-2
-            dy = (ys-cy+2) % 4-2
-            distance = dy[:, None]**2+dx[None, :]**2
-            closer = distance < best
-            runner_up = (~closer) & (distance < second)
-            second[closer], second_index[closer] = best[closer], first_index[closer]
-            second[runner_up], second_index[runner_up] = distance[runner_up], index
-            best[closer], first_index[closer] = distance[closer], index
+        ys = (np.arange(start, end, dtype="float32")+.5)*(rows/h)
+        for left in range(0, w, 8192):
+            xs = all_xs[left:left+8192]
+            shape = (end-start, len(xs))
+            best = np.full(shape, np.inf, dtype="float32")
+            second = best.copy()
+            first_index = np.zeros(shape, dtype="uint8")
+            second_index = first_index.copy()
+            for index, (cx, cy) in enumerate(centers):
+                dx = (xs-cx+columns/2) % columns-columns/2
+                dy = (ys-cy+rows/2) % rows-rows/2
+                distance = dy[:, None]**2+dx[None, :]**2
+                closer = distance < best
+                runner_up = (~closer) & (distance < second)
+                second[closer], second_index[closer] = best[closer], first_index[closer]
+                second[runner_up], second_index[runner_up] = distance[runner_up], index
+                best[closer], first_index[closer] = distance[closer], index
 
-        def sample(indices):
-            center = centers[indices]
-            dx = (xs[None, :]-center[..., 0]+2) % 4-2
-            dy = (ys[:, None]-center[..., 1]+2) % 4-2
-            map_x = ((dx+.5)*tile_w-.5).astype("float32")
-            map_y = ((dy+.5)*tile_h-.5).astype("float32")
-            return cv2.remap(tile, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+            def sample(indices):
+                center = centers[indices]
+                dx = (xs[None, :]-center[..., 0]+columns/2) % columns-columns/2
+                dy = (ys[:, None]-center[..., 1]+rows/2) % rows-rows/2
+                map_x = ((dx+.5)*tile_w-.5).astype("float32")
+                map_y = ((dy+.5)*tile_h-.5).astype("float32")
+                return cv2.remap(tile, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
 
-        base, neighbor = sample(first_index), sample(second_index)
-        # Only the closest two patches contribute, preventing all-over blur.
-        gap = np.clip((np.sqrt(second)-np.sqrt(best))/.12, 0, 1)
-        weight = (.5*(1-gap*gap*(3-2*gap)))[..., None]
-        result[start:end] = base*(1-weight)+neighbor*weight
+            base, neighbor = sample(first_index), sample(second_index)
+            # Only the closest two patches contribute, preventing all-over blur.
+            gap = np.clip((np.sqrt(second)-np.sqrt(best))/.12, 0, 1)
+            weight = (.5*(1-gap*gap*(3-2*gap)))[..., None]
+            result[start:end, left:left+len(xs)] = base*(1-weight)+neighbor*weight
     return result
 
 
@@ -78,6 +84,10 @@ def periodic_rotate(image, angle):
     return seamless(rotated)
 
 
+def rotation_angle(rng, direction=True, arbitrary_angle=False):
+    return rng.uniform(0, 360) if arbitrary_angle and not direction else int(rng.choice([0, 180] if direction else [0, 90, 180, 270]))
+
+
 def generate_variants(image, count=4, seed=42, direction=True, mirror=False,
         brightness=.05, hue=.01, saturation=.05, contrast=.05, translate=True,
         arbitrary_angle=False, progress=lambda value: None):
@@ -90,7 +100,7 @@ def generate_variants(image, count=4, seed=42, direction=True, mirror=False,
     outputs = []
     for index in range(count):
         progress(60 + int(index / count * 35))
-        angle = rng.uniform(0, 360) if arbitrary_angle and not direction else rng.choice([0, 180] if direction else [0, 90, 180, 270])
+        angle = rotation_angle(rng, direction, arbitrary_angle)
         result = periodic_rotate(image, angle)
         if mirror and rng.random() < .5:
             result = result[:, ::-1]

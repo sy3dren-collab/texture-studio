@@ -132,3 +132,28 @@ def test_escape_during_bump_render_cancels_without_destroying_running_thread(bum
     finally:
         release.set()
     wait_bump(app, dialog, errors)
+
+
+def test_invert_switch_updates_bump_normals_and_full_resolution_file(bump_editor, tmp_path, monkeypatch):
+    app, dialog, path, errors = bump_editor
+    original = dialog.result.copy()
+    dialog.invert_button.setChecked(True)
+    wait_bump(app, dialog, errors)
+    np.testing.assert_allclose(dialog.result, 1-original, atol=1e-7)
+    target = tmp_path / "反轉_BUMP.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    dialog.save_file()
+    wait_bump(app, dialog, errors)
+    expected = tmp_path / "反轉預期.jpg"
+    save_image(1-make_bump(dialog.source), expected, color_space="linear", repeat=2)
+    assert target.read_bytes() == expected.read_bytes()
+    dialog.normal_button.setChecked(True)
+    wait_bump(app, dialog, errors)
+    inverted = dialog.result.copy()
+    dialog.invert_button.setChecked(False)
+    wait_bump(app, dialog, errors)
+    np.testing.assert_allclose(inverted[..., :2], 1-dialog.result[..., :2], atol=1e-6)
+    np.testing.assert_allclose(inverted[..., 2], dialog.result[..., 2], atol=1e-6)
+    dialog.normal_button.setChecked(False)
+    wait_bump(app, dialog, errors)
+    np.testing.assert_array_equal(dialog.result, original)

@@ -42,6 +42,11 @@ class BumpDialog(QDialog):
         self.normal_button.setCheckable(True)
         self.normal_button.toggled.connect(self.toggle_normal)
         tools.addWidget(self.normal_button)
+        self.invert_button = QPushButton("黑白反轉")
+        self.invert_button.setCheckable(True)
+        self.invert_button.setToolTip("反轉 BUMP 黑白；法線會使用反轉後的高度重新計算")
+        self.invert_button.toggled.connect(self.request_preview)
+        tools.addWidget(self.invert_button)
         tools.addWidget(QLabel("預覽"))
         self.repeat = QComboBox()
         self.repeat.addItems(["1", "2", "3", "4"])
@@ -70,7 +75,8 @@ class BumpDialog(QDialog):
     def settings(self):
         return {"brightness": self.brightness.value()/100, "contrast": self.contrast.value()/100,
                 "strength": self.strength.value()/50, "normal": self.normal_button.isChecked(),
-                "generation": self.generation, "repeat": int(self.repeat.currentText())}
+                "generation": self.generation, "repeat": int(self.repeat.currentText()),
+                "invert": self.invert_button.isChecked()}
 
     def request_preview(self, *_):
         self.generation += 1
@@ -121,6 +127,8 @@ class BumpDialog(QDialog):
             if ratio < 1:
                 image = cv2.resize(image, (max(4, round(image.shape[1]*ratio)), max(4, round(image.shape[0]*ratio))), interpolation=cv2.INTER_AREA)
             height = make_bump(image, settings["brightness"], settings["contrast"])
+            if settings["invert"]:
+                height = 1-height
             progress(50)
             result = bump_normal(height, settings["strength"]*ratio) if settings["normal"] else height
             progress(90)

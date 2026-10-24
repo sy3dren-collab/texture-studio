@@ -106,7 +106,7 @@ def test_selected_pixels_drive_processing_without_modifying_source(desktop):
 
 def test_modes_show_only_primary_numeric_controls(desktop):
     app, window, path, errors = desktop
-    for mode, expected in [(0, 0), (1, 0), (2, 3)]:
+    for mode, expected in [(0, 0), (1, 2), (2, 3)]:
         window.mode.setCurrentIndex(mode)
         app.processEvents()
         controls = [widget for widget in window.findChildren(QSpinBox)+window.findChildren(QDoubleSpinBox) if widget.isVisible()]
@@ -612,7 +612,7 @@ def test_stagger_controls_edit_preview_save_and_undo(desktop, tmp_path, monkeypa
     window.save_as()
     wait_render(app, window, errors)
     with Image.open(target) as image:
-        assert image.size == (640, 384)
+        assert image.size == (320, 192)
         decoded = np.asarray(image)/255
         assert np.abs(decoded-shifted).mean() < .006
     reference = tmp_path / "預期交錯結果.jpg"
@@ -642,7 +642,7 @@ def test_save_variant_changes_continues_as_full_resolution_material(desktop, tmp
     wait_render(app, window, errors)
     assert window.mode.currentIndex() == 0
     assert window.primary_button.text() == "一鍵製圖"
-    assert window.result.shape[1] == 4096
+    assert window.result.shape[1] == 2048
     assert len(captured) == 1
     np.testing.assert_array_equal(window.original, captured[0])
     np.testing.assert_array_equal(window.result, captured[0])
@@ -929,7 +929,7 @@ def test_random_mode_has_only_layout_controls_and_inherits_seamless_color(deskto
         assert control.isVisible()
     np.testing.assert_allclose(window.result[..., 0], window.result[..., 1], atol=1e-6)
     np.testing.assert_allclose(window.result[..., 1], window.result[..., 2], atol=1e-6)
-    assert window.result.shape == (384, 640, 3)
+    assert window.result.shape == (192, 320, 3)
     window.mode.setCurrentIndex(0)
     assert window.light.isVisible() and window.color_tools.isVisible() and window.reset_button.isVisible()
 
@@ -975,3 +975,90 @@ def test_brush_cursor_renders_only_a_white_circle_without_crosses(desktop, tool)
     assert overlay.pixelColor(50, 30).alpha() == 0
     assert overlay.pixelColor(80, 48).alpha() == 0
     assert overlay.pixelColor(40, 30) == QColor("white")
+
+
+def test_random_counts_default_to_four_and_can_be_changed_and_saved(desktop, tmp_path, monkeypatch):
+    from PIL import Image
+    app, window, path, errors = desktop
+    window.light.setValue(0)
+    window.repeat.setCurrentText("3")
+    window.mode.setCurrentIndex(1)
+    wait_render(app, window, errors)
+    assert window.repeat.currentText() == "1"
+    assert window.grid_columns.value() == window.grid_rows.value() == 2
+    assert window.result.shape == (192, 320, 3)
+    window.grid_columns.setValue(3)
+    window.grid_rows.setValue(1)
+    wait_render(app, window, errors)
+    assert window.result.shape == (96, 480, 3)
+    assert "共 3 份" in window.size_hint.text()
+    target = tmp_path / "三份原尺寸.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    with Image.open(target) as image:
+        assert image.size == (480, 96)
+
+
+def test_quarter_turn_keeps_rectangular_source_pixel_dimensions(desktop, tmp_path):
+    from texture_studio.variants import rotation_angle
+    app, window, path, errors = desktop
+    y, x = np.mgrid[:24, :40]
+    image = np.stack((x % 2, y % 2, (x+y) % 2), axis=-1).astype("float32")
+    source = tmp_path / "逐像素木紋.png"
+    save_image(image, source)
+    window.add_paths([str(source)])
+    window.assets.setCurrentRow(1)
+    wait_render(app, window, errors)
+    window.reset_original()
+    window.mode.setCurrentIndex(1)
+    window.direction.setChecked(False)
+    window.grid_columns.setValue(3)
+    window.grid_rows.setValue(2)
+    window.shift_x.setValue(0)
+    window.shift_y.setValue(0)
+    seed = next(seed for seed in range(20) if rotation_angle(np.random.default_rng(seed), False) % 180)
+    window.seed_value = seed
+    window.process()
+    wait_render(app, window, errors)
+    angle = rotation_angle(np.random.default_rng(seed), False)
+    expected = np.tile(np.rot90(image, angle//90), (2, 3, 1))
+    assert window.result.shape == expected.shape
+    np.testing.assert_allclose(window.result, expected, atol=1e-7)
+
+
+def test_one_click_commits_full_resolution_and_accumulates_rounds(desktop, tmp_path, monkeypatch):
+    app, window, path, errors = desktop
+    source_bytes = path.read_bytes()
+    window.set_crop([.2, .25, .8, .75])
+    window.light.setValue(0)
+    window.material_brightness.setValue(-50)
+    wait_render(app, window, errors)
+    first = window.result.copy()
+    QTest.mouseClick(window.primary_button, Qt.LeftButton)
+    wait_render(app, window, errors)
+    np.testing.assert_array_equal(window.original, first)
+    assert window.material_brightness.value() == 0
+    assert window.light.value() == 0 and window.material_scale.value() == 100
+    assert not window.regions
+    window.material_brightness.setValue(-50)
+    wait_render(app, window, errors)
+    second = window.result.copy()
+    np.testing.assert_allclose(second, first*.5, atol=1e-7)
+    QTest.mouseClick(window.primary_button, Qt.LeftButton)
+    wait_render(app, window, errors)
+    np.testing.assert_array_equal(window.original, second)
+    assert window.material_brightness.value() == 0
+    window.material_brightness.setValue(50)
+    wait_render(app, window, errors)
+    np.testing.assert_allclose(window.result, first, atol=1e-7)
+    target = tmp_path / "累積三輪.jpg"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(target), ""))
+    window.save_as()
+    wait_render(app, window, errors)
+    reference = tmp_path / "累積預期.jpg"
+    save_image(first, reference)
+    assert target.read_bytes() == reference.read_bytes()
+    assert path.read_bytes() == source_bytes
+    window.reset_original()
+    np.testing.assert_array_equal(window.result, load_image(path))
