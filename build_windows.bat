@@ -5,9 +5,8 @@ if not exist "windows_env.bat" exit /b 1
 call "%~dp0windows_env.bat"
 if not exist "%TS_VENV%\Scripts\python.exe" exit /b 1
 set "TS_BUILD_ROOT=%USERPROFILE%\.texture-studio\packaging"
-"%TS_VENV%\Scripts\python.exe" -m pytest -q
+if defined TEXTURE_STUDIO_BUILD_ROOT set "TS_BUILD_ROOT=%TEXTURE_STUDIO_BUILD_ROOT%"
+"%TS_VENV%\Scripts\python.exe" packaging\build_windows.py --output "%TS_BUILD_ROOT%"
 if errorlevel 1 exit /b 1
-"%TS_VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --name TextureStudio --collect-submodules texture_studio --distpath "%TS_BUILD_ROOT%\dist" --workpath "%TS_BUILD_ROOT%\build" --specpath "%TS_BUILD_ROOT%" "%CD%\launch.py"
-if errorlevel 1 exit /b 1
-echo Built %TS_BUILD_ROOT%\dist\TextureStudio\TextureStudio.exe
-echo Distribute the whole TextureStudio directory.
+echo Built and validated %TS_BUILD_ROOT%\release\TextureStudio.exe
+echo The release directory contains a standalone EXE, ZIP, checksum and Windows validation report.

@@ -37,11 +37,16 @@ def launch():
     logger, path = configure_logging()
     logger.info("Texture Studio startup: Python %s; %s; %s-bit", platform.python_version(), platform.system(), 64 if sys.maxsize > 2**32 else 32)
     try:
+        if len(sys.argv) > 1 and sys.argv[1] == "--smoke-test":
+            from texture_studio.smoke import run
+            if len(sys.argv) != 3:
+                raise ValueError("--smoke-test requires an output directory")
+            return run(sys.argv[2])
         from texture_studio.ui import main
         return main()
     except Exception:
         logger.exception("Texture Studio failed to start")
-        if sys.stderr is None and sys.platform == "win32":
+        if sys.stderr is None and sys.platform == "win32" and "--smoke-test" not in sys.argv:
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, f"Texture Studio 無法啟動。\n錯誤紀錄：{path}", "Texture Studio", 0x10)
         return 1

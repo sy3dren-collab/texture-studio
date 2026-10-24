@@ -6,6 +6,10 @@
 
 ## Windows 10／11
 
+獨立版由 GitHub 的 Windows 建置流程產生：執行完整測試後，以 PyInstaller 打包成單一 `TextureStudio.exe`，再從隔離資料夾、移除外部 Python 路徑的情況下實際啟動，確認 GUI、原尺寸排列、筆刷、JPEG、BUMP 與法線輸出。通過後才將 EXE、ZIP、SHA-256 與 Windows 驗證報告附加至對應版本的 GitHub Release。
+
+獨立版完整解壓縮後雙擊 `TextureStudio.exe`，不需安裝 Python，不開啟終端機。原始碼 ZIP 使用下列方式：
+
 先將 ZIP **完整解壓縮**到一般資料夾，不可在壓縮檔檢視器內直接執行。首次使用需安裝 64-bit Python 3.12（3.11–3.13 也支援，包含 Python Launcher），執行一次：
 
 ```bat
@@ -16,7 +20,7 @@ setup_windows.bat
 
 Windows 腳本會將環境安裝至 `%USERPROFILE%\.texture-studio\venv`，避免 ZIP 解壓縮目錄過長，導致 PySide6 安裝失敗。不需系統管理員權限或修改 Windows 長路徑登錄設定。安裝、啟動、診斷與打包使用相同短路徑；也可設定 `TEXTURE_STUDIO_VENV` 使用自訂位置。先前安裝失敗的專案內 `.venv` 不會被刪除或沿用。
 
-若需獨立 Windows EXE，執行 `build_windows.bat`；現有設定使用 PyInstaller `--windowed`，啟動 EXE 不顯示終端機。打包結果為 `%USERPROFILE%\.texture-studio\packaging\dist\TextureStudio\TextureStudio.exe`，需分發**整個 TextureStudio 資料夾**，目標電腦不需 Python。打包必須在 Windows 執行；本次 Linux 環境沒有產生或驗證 Windows EXE，提供的是可沿用 Python 環境的無終端機啟動入口。
+自行建置時，在 Windows 執行 `build_windows.bat`。它會安裝固定版本的建置套件、執行完整測試，以 `--onefile --windowed` 打包，檢查 PE x64／GUI 子系統並實際啟動單檔 EXE。結果位於 `%USERPROFILE%\.texture-studio\packaging\release`，可用 `TEXTURE_STUDIO_BUILD_ROOT` 指定其他輸出位置。建置失敗或獨立啟動驗證失敗，不會產生可發布的 release 檔案。
 
 本版固定依賴支援 Python 3.11–3.13；Python 3.14 目前不支援。也可手動建立環境：
 

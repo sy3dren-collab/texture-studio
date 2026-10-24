@@ -1,5 +1,6 @@
 """Exercise the actual launcher, including missing dependencies in a subprocess."""
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -42,3 +43,16 @@ raise SystemExit(launch.launch())
                             env=environment, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert "Texture Studio startup" in (tmp_path / "logs" / "texture-studio.log").read_text(encoding="utf-8")
+
+
+def test_packaging_smoke_exercises_gui_and_exports_from_other_working_directory(tmp_path):
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    output = tmp_path / "獨立測試 with spaces"
+    result = subprocess.run([sys.executable, str(ROOT / "launch.py"), "--smoke-test", str(output)],
+                            cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stderr
+    report = json.loads((output / "smoke.json").read_text(encoding="utf-8"))
+    assert report["frozen"] is False
+    assert set(report["checks"]) == {"gui", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"}
+    assert report["images"] == {name: [576, 128] for name in ("preview.jpg", "BUMP.jpg", "NORMAL.png")}
