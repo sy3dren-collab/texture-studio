@@ -1,0 +1,45 @@
+{
+  "version": "0.7.0",
+  "frozen": true,
+  "runtime": "wine",
+  "platform": "win32",
+  "qt_platform": "windows",
+  "console_window": 0,
+  "checks": [
+    "gui",
+    "perspective",
+    "cumulative_edit",
+    "native_layout",
+    "brush",
+    "jpeg",
+    "bump_inversion",
+    "normal"
+  ],
+  "images": {
+    "preview.jpg": [
+      576,
+      128
+    ],
+    "BUMP.jpg": [
+      576,
+      128
+    ],
+    "NORMAL.png": [
+      576,
+      128
+    ]
+  },
+  "test_suite": {
+    "tests": 166,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 1,
+    "passed": 165
+  },
+  "architecture": "x64",
+  "subsystem": "GUI",
+  "sha256": "24ce6e4f94628055e3b17c90c69624a77773a498d5290a1cb212729ad28eac37",
+  "native_windows_verified": false,
+  "source_commit": "20fbae1e81747ae47603533e240365aa6c8e999a",
+  "build_image": "tobix/pywine@sha256:65dd1d8c0f3b4b951e49e9caababf12f497b02c45a883bd18c731e8eb9c2f9c0"
+}
