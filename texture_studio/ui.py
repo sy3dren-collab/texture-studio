@@ -6,7 +6,7 @@ from PySide6.QtCore import QThread, Slot, Qt, QPointF, QTimer
 from PySide6.QtGui import QImage, QPixmap, QColor, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QLabel, QFileDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QComboBox, QCheckBox, QMessageBox, QProgressBar, QScrollArea, QColorDialog)
+    QComboBox, QCheckBox, QMessageBox, QProgressBar, QScrollArea, QColorDialog, QDialog)
 from .core import load_image, save_image, correct_lighting, seamless, crop_image
 from .appearance import adjust_material
 from .capture import ScreenCapture
@@ -92,6 +92,10 @@ class Window(QMainWindow):
         self.full_image_button = QPushButton("恢復整張")
         self.full_image_button.clicked.connect(self.reset_crop)
         source_tools.addWidget(self.full_image_button)
+        self.perspective_button = QPushButton("透視矯正")
+        self.perspective_button.setToolTip("在素材上選取四個角，自動拉正成矩形")
+        self.perspective_button.clicked.connect(self.open_perspective)
+        source_tools.addWidget(self.perspective_button)
         self.clone_button = QPushButton("印章畫筆")
         self.clone_button.setCheckable(True)
         self.clone_button.toggled.connect(self.toggle_clone)
@@ -445,6 +449,7 @@ class Window(QMainWindow):
         for control in self.edit_controls:
             control.setEnabled(not locked and not self.preview.clone_mode)
         self.save_button.setEnabled(not locked)
+        self.perspective_button.setEnabled(not locked and not self.preview.clone_mode and self.thread is None)
 
     def toggle_clone(self, enabled, kind="clone"):
         button = self.dodge_button if kind == "dodge" else self.clone_button
@@ -610,6 +615,54 @@ class Window(QMainWindow):
     def current_path(self):
         index = self.assets.currentRow()
         return self.paths[index] if 0 <= index < len(self.paths) else None
+
+    def open_perspective(self):
+        if self.thread is not None or self._applying_variant or self.preview.clone_mode:
+            return
+        path = self.current_path()
+        if self.original is None or self.original_path != path:
+            self.error("請先匯入圖片，並等待載入完成")
+            return
+        from .perspective_ui import PerspectiveDialog
+        self.preview_timer.stop()
+        dialog = PerspectiveDialog(self.original, self.regions.get(path), self)
+        accepted = dialog.exec() == QDialog.Accepted
+        corners = dialog.view.normalized_points() if accepted else None
+        dialog.deleteLater()
+        if not accepted:
+            if self._pending_preview:
+                self.preview_timer.start(0)
+            return
+        source = self.original
+        self._pending_preview = False
+        self._generation += 1
+        self.lock_variant(True)
+        self._active_apply = True
+
+        def operation(progress):
+            from .perspective import rectify_perspective
+            progress(10)
+            result = rectify_perspective(source, corners)
+            progress(90)
+            return result
+
+        self.run_job(operation, lambda image: self.apply_perspective(image, path))
+
+    def apply_perspective(self, image, path):
+        self._restoring = True
+        try:
+            self._working_sources[path] = image
+            # Perspective correction changes the edges; make them seamless
+            # again when the usual texture pipeline runs.
+            self._staged_sources.discard(path)
+            self._source_cache.clear()
+            self.regions.pop(path, None)
+            self.crop_button.setChecked(False)
+            self.loaded(image, path)
+        finally:
+            self._restoring = False
+        self.metrics.setText("透視矯正已套用，可繼續製圖；原檔尚未變更")
+        self.request_preview()
 
     def edit_crop(self, enabled):
         if enabled:
@@ -953,6 +1006,7 @@ class Window(QMainWindow):
         self.assets.setEnabled(False)
         self.crop_button.setEnabled(False)
         self.full_image_button.setEnabled(False)
+        self.perspective_button.setEnabled(False)
         self.capture_button.setEnabled(False)
         self.clone_button.setEnabled(False)
         self.dodge_button.setEnabled(False)
@@ -986,6 +1040,7 @@ class Window(QMainWindow):
         self.assets.setEnabled(not self._applying_variant)
         self.crop_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
         self.full_image_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
+        self.perspective_button.setEnabled(not self._applying_variant and not self.preview.clone_mode)
         self.capture_button.setEnabled(not self._applying_variant)
         self.save_button.setEnabled(not self._applying_variant)
         self.reset_button.setEnabled(not self._applying_variant)

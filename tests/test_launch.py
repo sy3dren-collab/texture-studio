@@ -54,5 +54,5 @@ def test_packaging_smoke_exercises_gui_and_exports_from_other_working_directory(
     assert result.returncode == 0, result.stderr
     report = json.loads((output / "smoke.json").read_text(encoding="utf-8"))
     assert report["frozen"] is False
-    assert set(report["checks"]) == {"gui", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"}
+    assert set(report["checks"]) == {"gui", "perspective", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"}
     assert report["images"] == {name: [576, 128] for name in ("preview.jpg", "BUMP.jpg", "NORMAL.png")}

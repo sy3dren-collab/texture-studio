@@ -6,10 +6,12 @@ import sys
 import time
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, QTimer
 from PySide6.QtWidgets import QApplication
 from . import __version__
 from .core import save_image
+from .perspective import rectify_perspective
+from .perspective_ui import PerspectiveDialog
 from .ui import Window
 
 
@@ -45,6 +47,30 @@ def run(output):
     save_image(image, source)
     window.add_paths([str(source)])
     wait(window)
+    before = window.original.copy()
+    corners = [(.1, .1), (.9, .05), (.95, .9), (.05, .95)]
+
+    def select_perspective():
+        dialog = None
+        try:
+            dialog = window.findChild(PerspectiveDialog)
+            view = dialog.view
+            view.points = [QPointF(x*view.bounds.width(), y*view.bounds.height()) for x, y in corners]
+            view.selectionChanged.emit()
+            if not dialog.apply_button.isEnabled():
+                raise RuntimeError("Perspective selection was rejected")
+            dialog.apply_button.click()
+        except Exception as error:
+            errors.append(str(error))
+            if dialog is not None:
+                dialog.reject()
+
+    QTimer.singleShot(0, select_perspective)
+    window.open_perspective()
+    wait(window)
+    expected = rectify_perspective(before, corners)
+    if window.original.shape != expected.shape or not np.allclose(window.original, expected, atol=1e-6):
+        raise RuntimeError("Perspective correction did not update the material")
     window.reset_original()
     baseline = window.original.copy()
     window.material_brightness.setValue(-50)
@@ -99,7 +125,7 @@ def run(output):
     report = {"version": __version__, "frozen": bool(getattr(sys, "frozen", False)), "runtime": runtime,
               "platform": sys.platform, "qt_platform": app.platformName(),
               "console_window": ctypes.windll.kernel32.GetConsoleWindow() if sys.platform == "win32" else None,
-              "checks": ["gui", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"],
+              "checks": ["gui", "perspective", "cumulative_edit", "native_layout", "brush", "jpeg", "bump_inversion", "normal"],
               "images": sizes}
     (output / "smoke.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0

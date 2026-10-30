@@ -3,12 +3,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import Qt, QPointF, QObject, Signal, QThread, QTimer
+from PySide6.QtCore import Qt, QPoint, QPointF, QObject, Signal, QThread, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QSpinBox, QDoubleSpinBox, QPushButton, QColorDialog, QFileDialog, QMessageBox, QLabel, QCheckBox
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QWheelEvent
 from texture_studio.ui import Window
 from texture_studio.core import crop_image, load_image, save_image
+from texture_studio.perspective import rectify_perspective
+from texture_studio.perspective_ui import PerspectiveDialog
 
 
 def wait_job(app, window, errors):
@@ -61,6 +63,129 @@ def drag(preview, start, end):
     QTest.mousePress(viewport, Qt.LeftButton, pos=preview.mapFromScene(start))
     QTest.mouseMove(viewport, preview.mapFromScene(end), delay=10)
     QTest.mouseRelease(viewport, Qt.LeftButton, pos=preview.mapFromScene(end))
+
+
+def test_perspective_dialog_draw_drag_invalid_and_cancel(desktop):
+    app, window, path, errors = desktop
+    dialog = PerspectiveDialog(window.original, parent=window)
+    dialog.show()
+    app.processEvents()
+    view = dialog.view
+    drag(view, QPointF(30, 25), QPointF(125, 80))
+    first = np.array(view.normalized_points())
+    np.testing.assert_allclose(first[[0, 2]], [[30/159, 25/95], [125/159, 80/95]], atol=.01)
+    drag(view, view.points[1], QPointF(116, 13))
+    changed = np.array(view.normalized_points())
+    np.testing.assert_allclose(changed[1], [116/159, 13/95], atol=.01)
+    np.testing.assert_allclose(changed[[0, 2, 3]], first[[0, 2, 3]], atol=.01)
+    assert dialog.apply_button.isEnabled()
+    drag(view, view.points[1], QPointF(10, 90))
+    assert not dialog.apply_button.isEnabled()
+    view.reset_selection()
+    assert dialog.apply_button.isEnabled()
+    before_zoom = view.transform().m11()
+    center = view.viewport().rect().center()
+    wheel = QWheelEvent(QPointF(center), QPointF(view.viewport().mapToGlobal(center)), QPoint(), QPoint(0, 120),
+                        Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(view.viewport(), wheel)
+    assert view.transform().m11() > before_zoom
+    drag(view, view.points[0], QPointF(25, 15))
+    np.testing.assert_allclose(view.normalized_points()[0], [25/159, 15/95], atol=.01)
+    dialog.reject()
+    assert str(path) not in window._working_sources
+
+
+def test_perspective_applies_to_current_source_and_restores_original(desktop):
+    app, window, path, errors = desktop
+    source_bytes = path.read_bytes()
+    imported = window.original.copy()
+    window.light.setValue(0)
+    window.material_brightness.setValue(-20)
+    wait_render(app, window, errors)
+    window.primary_action()
+    wait_render(app, window, errors)
+    staged = window.original.copy()
+    assert not np.array_equal(staged, imported)
+    window.set_crop([.1, .1, .9, .9])
+    window.material_brightness.setValue(-20)
+    wait_render(app, window, errors)
+    selected = []
+
+    def select_and_apply():
+        dialog = window.findChild(PerspectiveDialog)
+        assert dialog is not None
+        view = dialog.view
+        drag(view, view.points[1], QPointF(view.bounds.width()*.83, view.bounds.height()*.16))
+        selected.extend(view.normalized_points())
+        assert dialog.apply_button.isEnabled()
+        dialog.apply_button.click()
+
+    QTimer.singleShot(0, select_and_apply)
+    window.open_perspective()
+    wait_render(app, window, errors)
+    expected = rectify_perspective(staged, selected)
+    np.testing.assert_allclose(window.original, expected, atol=1e-6)
+    assert window.material_brightness.value() == -20
+    assert str(path) not in window.regions
+    assert path.read_bytes() == source_bytes
+    assert window._working_sources[str(path)] is window.original
+    window.reset_original()
+    np.testing.assert_array_equal(window.original, imported)
+
+
+def test_cancel_perspective_keeps_crop_and_pending_adjustments(desktop):
+    app, window, path, errors = desktop
+    source = window.original.copy()
+    region = [.1, .2, .9, .8]
+    window.set_crop(region)
+    window.light.setValue(0)
+    window.material_brightness.setValue(-30)
+
+    def cancel():
+        dialog = window.findChild(PerspectiveDialog)
+        assert dialog is not None
+        drag(dialog.view, dialog.view.points[0], QPointF(25, 25))
+        dialog.reject()
+
+    QTimer.singleShot(0, cancel)
+    window.open_perspective()
+    wait_render(app, window, errors)
+    assert window.regions[str(path)] == region
+    assert window.material_brightness.value() == -30
+    np.testing.assert_array_equal(window.original, source)
+    assert window.result.shape == crop_image(source, region).shape
+
+
+def test_perspective_accepts_screenshot_material(desktop):
+    app, window, path, errors = desktop
+    pixels = np.full((80, 120, 3), [80, 120, 160], dtype="uint8")
+    shot = QImage(pixels.data, 120, 80, pixels.strides[0], QImage.Format_RGB888).copy()
+    window.import_capture(shot)
+    wait_render(app, window, errors)
+    captured_path = window.current_path()
+
+    def select_and_apply():
+        dialog = window.findChild(PerspectiveDialog)
+        assert dialog is not None
+        dialog.apply_button.click()
+
+    QTimer.singleShot(0, select_and_apply)
+    window.open_perspective()
+    wait_render(app, window, errors)
+    assert captured_path in window._capture_paths
+    assert captured_path in window._working_sources
+    assert window.original.shape[:2] != (80, 120)
+
+
+def test_perspective_preview_uses_original_resolution(desktop):
+    _, window, _, _ = desktop
+    image = np.random.default_rng(7).random((500, 1800, 3), dtype=np.float32)
+    dialog = PerspectiveDialog(image, [0, 0, 1, 1], window)
+    assert dialog.view.bounds.width() == 1599  # display copy is reduced
+    corrected = rectify_perspective(image, dialog.view.normalized_points())
+    assert corrected.shape == image.shape
+    np.testing.assert_allclose(corrected, image, atol=1e-6)
+    dialog.close()
 
 
 def test_draw_move_resize_and_reset_source_selection(desktop):
